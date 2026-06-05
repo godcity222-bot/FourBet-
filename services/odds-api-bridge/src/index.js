@@ -130,7 +130,9 @@ async function refreshEvents() {
         event_id:      String(e.id),
         sport_key:     String(e.sport_key ?? sport),
         sport_title:   e.sport_title ?? null,
-        commence_time: new Date(e.commence_time).toISOString(),
+        commence_time: new Date(
+  e.commence_time || e.commenceTime || e.start_time || e.starts_at || e.startAt || e.date || Date.now()
+).toISOString(),
         home_team:     String(e.home_team ?? ""),
         away_team:     String(e.away_team ?? ""),
         is_live:       Boolean(e.in_play ?? false),
