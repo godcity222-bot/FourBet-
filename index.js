@@ -38,7 +38,6 @@ if (!API_KEY || !INGEST_URL || !INGEST_KEY) {
   process.exit(1);
 }
 
-// Map odds-api.io market codes -> our DB market names
 const MARKET_MAP = {
   ML: "h2h",
   Spread: "spreads",
@@ -47,6 +46,19 @@ const MARKET_MAP = {
   DC: "double_chance",
   DNB: "draw_no_bet",
 };
+
+// --- Backoff config -------------------------------------------------------
+// Provider sends 1013 ("Try Again Later") when we reconnect too fast.
+// Respect it with exponential backoff per sport. Reset only after a stable
+// connection (>= STABLE_MS without a close).
+const BASE_BACKOFF_MS = 5_000;        // start delay
+const MAX_BACKOFF_MS  = 5 * 60_000;   // cap 5 min
+const COOLDOWN_BACKOFF_MS = 30_000;   // min wait when server says 1013
+const STABLE_MS = 60_000;             // mark "healthy" after 60s open
+const JITTER_PCT = 0.25;
+
+const backoff = new Map();  // sport -> current backoff ms
+const timers  = new Map();  // sport -> pending reconnect timer
 
 let buffer = [];
 let lastSeq = null;
@@ -70,6 +82,7 @@ async function flush() {
     });
     if (!res.ok) {
       console.error("[ingest] non-2xx", res.status, await res.text());
+      if (buffer.length < 5000) buffer.unshift(...batch);
     } else {
       const j = await res.json().catch(() => ({}));
       console.log(
@@ -77,7 +90,7 @@ async function flush() {
       );
     }
   } catch (e) {
-    console.error("[ingest] error", e);
+    console.error("[ingest] error", e?.message || e);
     if (buffer.length < 5000) buffer.unshift(...batch);
   }
 }
@@ -97,54 +110,36 @@ function normalize(msg) {
     const dbMarket = MARKET_MAP[m.name];
     if (!dbMarket) continue;
     const oddsList = Array.isArray(m.odds) ? m.odds : [];
-
     for (const o of oddsList) {
       if (dbMarket === "h2h") {
-        if (o.home != null)
-          out.push(row(eventId, bookmaker, "h2h", "home", 0, o.home, providerTs));
-        if (o.draw != null)
-          out.push(row(eventId, bookmaker, "h2h", "draw", 0, o.draw, providerTs));
-        if (o.away != null)
-          out.push(row(eventId, bookmaker, "h2h", "away", 0, o.away, providerTs));
+        if (o.home != null) out.push(row(eventId, bookmaker, "h2h", "home", 0, o.home, providerTs));
+        if (o.draw != null) out.push(row(eventId, bookmaker, "h2h", "draw", 0, o.draw, providerTs));
+        if (o.away != null) out.push(row(eventId, bookmaker, "h2h", "away", 0, o.away, providerTs));
       } else if (dbMarket === "totals") {
         const point = num(o.hdp);
         if (point == null) continue;
-        if (o.over != null)
-          out.push(row(eventId, bookmaker, "totals", "over", point, o.over, providerTs));
-        if (o.under != null)
-          out.push(row(eventId, bookmaker, "totals", "under", point, o.under, providerTs));
+        if (o.over != null)  out.push(row(eventId, bookmaker, "totals", "over",  point, o.over,  providerTs));
+        if (o.under != null) out.push(row(eventId, bookmaker, "totals", "under", point, o.under, providerTs));
       } else if (dbMarket === "spreads") {
         const point = num(o.hdp);
         if (point == null) continue;
-        if (o.home != null)
-          out.push(row(eventId, bookmaker, "spreads", "home", point, o.home, providerTs));
-        if (o.away != null)
-          out.push(row(eventId, bookmaker, "spreads", "away", -point, o.away, providerTs));
+        if (o.home != null) out.push(row(eventId, bookmaker, "spreads", "home",  point, o.home, providerTs));
+        if (o.away != null) out.push(row(eventId, bookmaker, "spreads", "away", -point, o.away, providerTs));
       } else if (dbMarket === "btts") {
-        // Both Teams To Score — Yes/No
         const yes = o.yes ?? o.Yes ?? o.YES;
-        const no = o.no ?? o.No ?? o.NO;
-        if (yes != null)
-          out.push(row(eventId, bookmaker, "btts", "yes", 0, yes, providerTs));
-        if (no != null)
-          out.push(row(eventId, bookmaker, "btts", "no", 0, no, providerTs));
+        const no  = o.no  ?? o.No  ?? o.NO;
+        if (yes != null) out.push(row(eventId, bookmaker, "btts", "yes", 0, yes, providerTs));
+        if (no  != null) out.push(row(eventId, bookmaker, "btts", "no",  0, no,  providerTs));
       } else if (dbMarket === "double_chance") {
-        // Double Chance — 1X / 12 / X2
         const homeDraw = o["1x"] ?? o["1X"] ?? o.home_draw;
         const homeAway = o["12"] ?? o.home_away;
         const awayDraw = o["x2"] ?? o["X2"] ?? o.away_draw;
-        if (homeDraw != null)
-          out.push(row(eventId, bookmaker, "double_chance", "1x", 0, homeDraw, providerTs));
-        if (homeAway != null)
-          out.push(row(eventId, bookmaker, "double_chance", "12", 0, homeAway, providerTs));
-        if (awayDraw != null)
-          out.push(row(eventId, bookmaker, "double_chance", "x2", 0, awayDraw, providerTs));
+        if (homeDraw != null) out.push(row(eventId, bookmaker, "double_chance", "1x", 0, homeDraw, providerTs));
+        if (homeAway != null) out.push(row(eventId, bookmaker, "double_chance", "12", 0, homeAway, providerTs));
+        if (awayDraw != null) out.push(row(eventId, bookmaker, "double_chance", "x2", 0, awayDraw, providerTs));
       } else if (dbMarket === "draw_no_bet") {
-        // Draw No Bet — Home/Away (push on draw)
-        if (o.home != null)
-          out.push(row(eventId, bookmaker, "draw_no_bet", "home", 0, o.home, providerTs));
-        if (o.away != null)
-          out.push(row(eventId, bookmaker, "draw_no_bet", "away", 0, o.away, providerTs));
+        if (o.home != null) out.push(row(eventId, bookmaker, "draw_no_bet", "home", 0, o.home, providerTs));
+        if (o.away != null) out.push(row(eventId, bookmaker, "draw_no_bet", "away", 0, o.away, providerTs));
       }
     }
   }
@@ -170,6 +165,30 @@ function num(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+function jitter(ms) {
+  const delta = ms * JITTER_PCT;
+  return Math.floor(ms - delta + Math.random() * 2 * delta);
+}
+
+function scheduleReconnect(sport, closeCode) {
+  // Don't stack timers
+  if (timers.has(sport)) return;
+
+  const prev = backoff.get(sport) ?? BASE_BACKOFF_MS;
+  // 1013 = Try Again Later → force a strong cooldown floor
+  const floor = closeCode === 1013 ? COOLDOWN_BACKOFF_MS : BASE_BACKOFF_MS;
+  const next  = Math.min(MAX_BACKOFF_MS, Math.max(floor, prev * 2));
+  backoff.set(sport, next);
+
+  const wait = jitter(next);
+  console.log(`[ws:${sport}] reconnect in ${Math.round(wait / 1000)}s (code=${closeCode})`);
+  const t = setTimeout(() => {
+    timers.delete(sport);
+    connect(sport);
+  }, wait);
+  timers.set(sport, t);
+}
+
 function connect(sport) {
   const url = new URL("wss://api.odds-api.io/v3/ws");
   url.searchParams.set("apiKey", API_KEY);
@@ -179,41 +198,67 @@ function connect(sport) {
 
   console.log(`[ws:${sport}] connecting`);
   const ws = new WebSocket(url.toString());
+
   let alive = true;
+  let stableTimer = null;
+  let closed = false;
+
   const ping = setInterval(() => {
     if (!alive) {
-      ws.terminate();
+      try { ws.terminate(); } catch {}
       return;
     }
     alive = false;
-    try {
-      ws.ping();
-    } catch {}
-  }, 30000);
+    try { ws.ping(); } catch {}
+  }, 30_000);
 
   ws.on("pong", () => (alive = true));
-  ws.on("open", () => console.log(`[ws:${sport}] open`));
+
+  ws.on("open", () => {
+    console.log(`[ws:${sport}] open`);
+    // If we stay connected for STABLE_MS, reset backoff for this sport
+    stableTimer = setTimeout(() => {
+      backoff.set(sport, BASE_BACKOFF_MS);
+    }, STABLE_MS);
+  });
+
   ws.on("message", (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (msg.seq != null) lastSeq = Math.max(lastSeq ?? 0, Number(msg.seq) || 0);
     const rows = normalize(msg);
     if (rows.length) pushRows(rows);
   });
-  ws.on("error", (e) => console.error(`[ws:${sport}] error`, e.message));
-  ws.on("close", (code, reason) => {
+
+  ws.on("error", (e) => {
+    // Avoid noisy stack — close handler will schedule reconnect
+    console.error(`[ws:${sport}] error ${e?.message || e}`);
+  });
+
+  ws.on("close", (code, reasonBuf) => {
+    if (closed) return;
+    closed = true;
     clearInterval(ping);
+    if (stableTimer) clearTimeout(stableTimer);
+    const reason = reasonBuf?.toString?.() || "";
     console.warn(`[ws:${sport}] closed code=${code} reason=${reason}`);
-    const wait = 2000 + Math.random() * 3000;
-    setTimeout(() => connect(sport), wait);
+    scheduleReconnect(sport, code);
   });
 }
 
-for (const sport of SPORTS) connect(sport);
+// Stagger initial connections so we don't open 8 sockets in the same tick
+SPORTS.forEach((sport, i) => {
+  setTimeout(() => connect(sport), i * 750);
+});
+
 console.log(
   `[worker] started for sports: ${SPORTS.join(", ")} markets: ${MARKETS.join(",")}`,
 );
+
+// Graceful shutdown so Railway redeploys are clean
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    console.log(`[worker] ${sig} received, flushing…`);
+    flush().finally(() => process.exit(0));
+  });
+}
