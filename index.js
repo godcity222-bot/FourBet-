@@ -9,6 +9,8 @@
 //
 // Optional:
 //   SPORTS                 — comma-separated; defaults to all supported sports
+//   MARKETS                — comma-separated odds-api.io market codes;
+//                            default "ML,Spread,Totals,BTTS,DC,DNB"
 //   FLUSH_MS               — batch flush interval; default 1500
 
 import WebSocket from "ws";
@@ -17,10 +19,16 @@ const API_KEY = process.env.ODDS_API_IO_KEY;
 const INGEST_URL = process.env.INGEST_URL;
 const INGEST_KEY = process.env.REALTIME_INGEST_KEY;
 const FLUSH_MS = Number(process.env.FLUSH_MS || 1500);
+
 const SPORTS = (
   process.env.SPORTS ||
   "football,basketball,baseball,hockey,tennis,mma,americanfootball,rugby"
 )
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const MARKETS = (process.env.MARKETS || "ML,Spread,Totals,BTTS,DC,DNB")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -30,7 +38,15 @@ if (!API_KEY || !INGEST_URL || !INGEST_KEY) {
   process.exit(1);
 }
 
-const MARKET_MAP = { ML: "h2h", Spread: "spreads", Totals: "totals" };
+// Map odds-api.io market codes -> our DB market names
+const MARKET_MAP = {
+  ML: "h2h",
+  Spread: "spreads",
+  Totals: "totals",
+  BTTS: "btts",
+  DC: "double_chance",
+  DNB: "draw_no_bet",
+};
 
 let buffer = [];
 let lastSeq = null;
@@ -65,6 +81,7 @@ async function flush() {
     if (buffer.length < 5000) buffer.unshift(...batch);
   }
 }
+
 setInterval(flush, FLUSH_MS);
 
 function normalize(msg) {
@@ -74,8 +91,8 @@ function normalize(msg) {
   const providerTs = msg.timestamp
     ? new Date(Number(msg.timestamp) * 1000).toISOString()
     : null;
-  const out = [];
 
+  const out = [];
   for (const m of msg.markets) {
     const dbMarket = MARKET_MAP[m.name];
     if (!dbMarket) continue;
@@ -103,6 +120,31 @@ function normalize(msg) {
           out.push(row(eventId, bookmaker, "spreads", "home", point, o.home, providerTs));
         if (o.away != null)
           out.push(row(eventId, bookmaker, "spreads", "away", -point, o.away, providerTs));
+      } else if (dbMarket === "btts") {
+        // Both Teams To Score — Yes/No
+        const yes = o.yes ?? o.Yes ?? o.YES;
+        const no = o.no ?? o.No ?? o.NO;
+        if (yes != null)
+          out.push(row(eventId, bookmaker, "btts", "yes", 0, yes, providerTs));
+        if (no != null)
+          out.push(row(eventId, bookmaker, "btts", "no", 0, no, providerTs));
+      } else if (dbMarket === "double_chance") {
+        // Double Chance — 1X / 12 / X2
+        const homeDraw = o["1x"] ?? o["1X"] ?? o.home_draw;
+        const homeAway = o["12"] ?? o.home_away;
+        const awayDraw = o["x2"] ?? o["X2"] ?? o.away_draw;
+        if (homeDraw != null)
+          out.push(row(eventId, bookmaker, "double_chance", "1x", 0, homeDraw, providerTs));
+        if (homeAway != null)
+          out.push(row(eventId, bookmaker, "double_chance", "12", 0, homeAway, providerTs));
+        if (awayDraw != null)
+          out.push(row(eventId, bookmaker, "double_chance", "x2", 0, awayDraw, providerTs));
+      } else if (dbMarket === "draw_no_bet") {
+        // Draw No Bet — Home/Away (push on draw)
+        if (o.home != null)
+          out.push(row(eventId, bookmaker, "draw_no_bet", "home", 0, o.home, providerTs));
+        if (o.away != null)
+          out.push(row(eventId, bookmaker, "draw_no_bet", "away", 0, o.away, providerTs));
       }
     }
   }
@@ -121,6 +163,7 @@ function row(event_id, bookmaker, market, selection, point, price, provider_ts) 
     ...(provider_ts ? { provider_ts } : {}),
   };
 }
+
 function num(v) {
   if (v == null) return null;
   const n = Number(v);
@@ -131,12 +174,11 @@ function connect(sport) {
   const url = new URL("wss://api.odds-api.io/v3/ws");
   url.searchParams.set("apiKey", API_KEY);
   url.searchParams.set("sport", sport);
-  url.searchParams.set("markets", "ML,Spread,Totals");
+  url.searchParams.set("markets", MARKETS.join(","));
   if (lastSeq != null) url.searchParams.set("lastSeq", String(lastSeq));
 
   console.log(`[ws:${sport}] connecting`);
   const ws = new WebSocket(url.toString());
-
   let alive = true;
   const ping = setInterval(() => {
     if (!alive) {
@@ -172,4 +214,6 @@ function connect(sport) {
 }
 
 for (const sport of SPORTS) connect(sport);
-console.log(`[worker] started for sports: ${SPORTS.join(", ")}`);
+console.log(
+  `[worker] started for sports: ${SPORTS.join(", ")} markets: ${MARKETS.join(",")}`,
+);
