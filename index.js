@@ -1,11 +1,12 @@
 /**
- * odds-api-bridge v2.0.5
+ * odds-api-bridge v2.0.6
  *
  * Persistent WebSocket from odds-api.io -> Supabase upserts.
  * - REST seeder populates odds_api_events so FK never fails
  * - knownEventIds cache prevents FK log spam
  * - Sorted upserts + retry on deadlock (40P01)
  * - Serialized message processing to eliminate concurrent row contention
+ * - Strips trailing slash from SUPABASE_URL (fixes PGRST125 "Invalid path")
  */
 
 import http from "node:http";
@@ -21,10 +22,10 @@ const required = (name) => {
 };
 
 const ODDS_API_KEY              = required("ODDS_API_IO_KEY");
-const SUPABASE_URL              = required("SUPABASE_URL");
+const SUPABASE_URL              = required("SUPABASE_URL").replace(/\/+$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = required("SUPABASE_SERVICE_ROLE_KEY");
 const PORT                      = Number(process.env.PORT ?? 8080);
-const VERSION                   = "2.0.5";
+const VERSION                   = "2.0.6";
 
 const KEY_FINGERPRINT = crypto.createHash("sha256")
   .update(ODDS_API_KEY).digest("hex").slice(0, 8);
@@ -59,6 +60,8 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
   realtime: { enabled: false, transport: WebSocket },
 });
+
+console.log(`[boot] supabase url=${SUPABASE_URL}`);
 
 // ─── State ────────────────────────────────────────────────────────────────
 let ws = null;
@@ -300,14 +303,11 @@ function flattenEvent(evt) {
 async function handleEvent(evt) {
   if (!evt?.id) return;
   const eventId = `${EVENT_ID_PREFIX}${String(evt.id)}`;
-
-  // Skip until parent row exists (created by seeder)
   if (!knownEventIds.has(eventId)) return;
 
   const rows = flattenEvent(evt);
   if (!rows.length) return;
 
-  // Deterministic order → concurrent upserts lock rows in same sequence → no deadlock
   rows.sort((a, b) => {
     if (a.event_id  !== b.event_id)  return a.event_id  < b.event_id  ? -1 : 1;
     if (a.bookmaker !== b.bookmaker) return a.bookmaker < b.bookmaker ? -1 : 1;
@@ -323,12 +323,12 @@ async function handleEvent(evt) {
       .upsert(rows, { onConflict: "event_id,bookmaker,market,selection,point" });
     error = res.error;
     if (!error) break;
-    if (error.code === "40P01") {                          // deadlock — retry
+    if (error.code === "40P01") {
       stats.deadlockRetries += 1;
       await sleep(50 + Math.random() * 150 * (attempt + 1));
       continue;
     }
-    if (error.code === "23503") {                          // FK race → drop from cache, reseeder will restore
+    if (error.code === "23503") {
       knownEventIds.delete(eventId);
     }
     break;
@@ -390,12 +390,9 @@ function connect() {
   ws.on("message", (data) => {
     lastMessageAt = Date.now();
     stats.messages += 1;
-
-    // Serialize: process this message only after the previous one finished
     processingChain = processingChain.then(async () => {
       const text = data.toString().trim();
       if (!text) return;
-
       const payloads = parseFrame(text);
       if (!payloads.length) {
         stats.parseErrors += 1;
@@ -403,7 +400,6 @@ function connect() {
           { quiet: stats.parseErrors > 5 && stats.parseErrors % 100 !== 0 });
         return;
       }
-
       for (const payload of payloads) {
         const events = Array.isArray(payload?.events)
           ? payload.events
@@ -480,7 +476,7 @@ process.on("unhandledRejection", (e) => rememberError("unhandled", e));
 // ─── Boot ─────────────────────────────────────────────────────────────────
 console.log(`[boot] starting odds-api-bridge v${VERSION} key=${KEY_FINGERPRINT}`);
 (async () => {
-  await seedAllSports();        // populate parent rows first
+  await seedAllSports();
   setInterval(seedAllSports, SEED_INTERVAL_MS);
-  connect();                     // then open WS
+  connect();
 })().catch(e => { rememberError("boot", e); process.exit(1); });
