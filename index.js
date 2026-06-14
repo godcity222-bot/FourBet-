@@ -1,43 +1,39 @@
 /**
- * odds-api-bridge v2.0.4
+ * odds-api-bridge v2.0.5
  *
- * Single persistent WebSocket from odds-api.io -> Supabase upserts,
- * plus a periodic REST seeder so live_odds inserts always satisfy
- * the odds_api_events FK.
+ * Persistent WebSocket from odds-api.io -> Supabase upserts.
+ * - REST seeder populates odds_api_events so FK never fails
+ * - knownEventIds cache prevents FK log spam
+ * - Sorted upserts + retry on deadlock (40P01)
+ * - Serialized message processing to eliminate concurrent row contention
  */
 
 import http from "node:http";
 import crypto from "node:crypto";
 import WebSocket from "ws";
 import { createClient } from "@supabase/supabase-js";
-// version is hardcoded for flat-root deployment
 
 // ─── Config ───────────────────────────────────────────────────────────────
 const required = (name) => {
   const v = process.env[name];
-  if (!v) {
-    console.error(`[boot] missing required env var: ${name}`);
-    process.exit(1);
-  }
+  if (!v) { console.error(`[boot] missing required env var: ${name}`); process.exit(1); }
   return v;
 };
 
 const ODDS_API_KEY              = required("ODDS_API_IO_KEY");
 const SUPABASE_URL              = required("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = required("SUPABASE_SERVICE_ROLE_KEY");
-const PORT                      = Number(process.env.PORT ?? 3000);
-const VERSION                   = "2.0.4";
+const PORT                      = Number(process.env.PORT ?? 8080);
+const VERSION                   = "2.0.5";
 
 const KEY_FINGERPRINT = crypto.createHash("sha256")
   .update(ODDS_API_KEY).digest("hex").slice(0, 8);
 
-// Curated to popular betting sports. WS endpoint caps at 10 sports per connection.
 const SPORTS = (process.env.SPORTS ?? [
-  "football", "basketball", "tennis", "baseball", "american-football",
-  "ice-hockey", "mixed-martial-arts", "boxing", "rugby", "cricket",
+  "football","basketball","tennis","baseball","american-football",
+  "ice-hockey","mixed-martial-arts","boxing","rugby","cricket",
 ].join(",")).split(",").map(s => s.trim()).filter(Boolean);
 
-// Default to the full set the UI knows how to render.
 const MARKETS = (process.env.MARKETS ??
   "ML,Spread,Totals,BTTS,DC,DNB,ALT_Spread,ALT_Totals,Team_Totals," +
   "H2H_H1,Totals_H1,Spread_H1,BTTS_H1,DC_H1," +
@@ -49,16 +45,15 @@ const wsParams = new URLSearchParams({ apiKey: ODDS_API_KEY, markets: MARKETS.jo
 if (SPORTS.length && SPORTS.length <= 10) wsParams.set("sport", SPORTS.join(","));
 const WS_URL = `wss://api.odds-api.io/v3/ws?${wsParams.toString()}`;
 
-const EVENT_ID_PREFIX = process.env.EVENT_ID_PREFIX ?? "oddsapi:";
-const BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
-const WATCHDOG_MS = 90_000;
+const EVENT_ID_PREFIX     = process.env.EVENT_ID_PREFIX ?? "oddsapi:";
+const BACKOFF_MS          = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
+const WATCHDOG_MS         = 90_000;
 const METRICS_INTERVAL_MS = 30_000;
-const SEED_INTERVAL_MS = 5 * 60_000; // re-seed events every 5 minutes
+const SEED_INTERVAL_MS    = 5 * 60_000;
+const UPSERT_CHUNK        = 500;
 
 // ─── Supabase ─────────────────────────────────────────────────────────────
-if (typeof globalThis.WebSocket === "undefined") {
-  globalThis.WebSocket = WebSocket;
-}
+if (typeof globalThis.WebSocket === "undefined") globalThis.WebSocket = WebSocket;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
@@ -71,20 +66,16 @@ let backoffIdx = 0;
 let lastMessageAt = Date.now();
 let shuttingDown = false;
 let reconnectTimer = null;
-const knownEventIds = new Set(); // event_ids that we know exist in odds_api_events
+let seedRun = 0;
+let processingChain = Promise.resolve();
+const knownEventIds = new Set();
 
 const stats = {
   startedAt: new Date().toISOString(),
-  messages: 0,
-  upserts: 0,
-  parentUpserts: 0,
-  seedRuns: 0,
-  errors: 0,
-  parseErrors: 0,
-  reconnects: 0,
-  lastError: null,
-  lastUpsertAt: null,
-  lastSeedAt: null,
+  messages: 0, upserts: 0, parentUpserts: 0,
+  errors: 0, parseErrors: 0, reconnects: 0,
+  deadlockRetries: 0,
+  lastError: null, lastUpsertAt: null,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -119,34 +110,24 @@ const toDbMarket = (n) => {
 };
 
 const SUPPORTED_MARKETS = new Set([
-  "h2h", "spreads", "totals", "btts", "double_chance", "draw_no_bet",
-  "alternate_spreads", "alternate_totals", "team_totals",
-  "h2h_h1", "totals_h1", "spreads_h1", "btts_h1", "double_chance_h1",
-  "corners_totals", "corners_spreads", "corners_totals_h1", "corners_spreads_h1",
-  "cards_totals", "cards_spreads",
+  "h2h","spreads","totals","btts","double_chance","draw_no_bet",
+  "alternate_spreads","alternate_totals","team_totals",
+  "h2h_h1","totals_h1","spreads_h1","btts_h1","double_chance_h1",
+  "corners_totals","corners_spreads","corners_totals_h1","corners_spreads_h1",
+  "cards_totals","cards_spreads",
 ]);
 
 const MARKET_BASE = {
-  spreads: "spreads",
-  alternate_spreads: "spreads",
-  totals: "totals",
-  alternate_totals: "totals",
-  corners_totals: "totals",
-  corners_spreads: "spreads",
-  corners_totals_h1: "totals",
-  corners_spreads_h1: "spreads",
-  cards_totals: "totals",
-  cards_spreads: "spreads",
-  btts: "btts",
-  btts_h1: "btts",
-  double_chance: "double_chance",
-  double_chance_h1: "double_chance",
-  h2h: "h2h",
-  h2h_h1: "h2h",
-  spreads_h1: "spreads",
-  totals_h1: "totals",
-  draw_no_bet: "draw_no_bet",
-  team_totals: "team_totals",
+  spreads:"spreads", alternate_spreads:"spreads",
+  totals:"totals", alternate_totals:"totals",
+  corners_totals:"totals", corners_spreads:"spreads",
+  corners_totals_h1:"totals", corners_spreads_h1:"spreads",
+  cards_totals:"totals", cards_spreads:"spreads",
+  btts:"btts", btts_h1:"btts",
+  double_chance:"double_chance", double_chance_h1:"double_chance",
+  h2h:"h2h", h2h_h1:"h2h",
+  spreads_h1:"spreads", totals_h1:"totals",
+  draw_no_bet:"draw_no_bet", team_totals:"team_totals",
 };
 
 const isLive = (v) => {
@@ -158,10 +139,8 @@ function formatError(err) {
   if (err instanceof Error) return err.message;
   if (err && typeof err === "object") {
     const shaped = {
-      message: err.message ?? null,
-      details: err.details ?? null,
-      hint: err.hint ?? null,
-      code: err.code ?? null,
+      message: err.message ?? null, details: err.details ?? null,
+      hint: err.hint ?? null, code: err.code ?? null,
     };
     try { return JSON.stringify(shaped); } catch { return String(err); }
   }
@@ -175,102 +154,70 @@ function rememberError(stage, err, { quiet = false } = {}) {
   if (!quiet) console.error(`[err:${stage}] ${msg}`);
 }
 
-// ─── REST event seeder (populates odds_api_events for FK) ─────────────────
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ─── REST Seeder (populates odds_api_events) ──────────────────────────────
 async function seedEventsForSport(sport) {
+  const url = `https://api.odds-api.io/v3/events?apiKey=${ODDS_API_KEY}&sport=${encodeURIComponent(sport)}&limit=5000`;
+  let res;
   try {
-    const url = `https://api.odds-api.io/v3/events?apiKey=${encodeURIComponent(ODDS_API_KEY)}&sport=${encodeURIComponent(sport)}&limit=5000`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      rememberError("seed_fetch", new Error(`${sport} HTTP ${res.status}`));
-      return 0;
-    }
-    const events = await res.json();
-    if (!Array.isArray(events) || !events.length) return 0;
-
-    const rows = events
-      .filter((e) => e?.id && (e.home || e.home_team) && (e.away || e.away_team))
-      .map((e) => ({
-        event_id: `${EVENT_ID_PREFIX}${String(e.id)}`,
-        sport_key: String(e.sport?.slug ?? e.sport_key ?? sport),
-        sport_title: e.sport?.name ?? e.league?.name ?? null,
-        commence_time: safeIso(e.date ?? e.commence_time),
-        home_team: String(e.home ?? e.home_team ?? ""),
-        away_team: String(e.away ?? e.away_team ?? ""),
-        is_live: isLive(e.status),
-        last_seen_at: new Date().toISOString(),
-      }));
-
-    if (!rows.length) return 0;
-
-    let total = 0;
-    for (let i = 0; i < rows.length; i += 500) {
-      const chunk = rows.slice(i, i + 500);
-      const { error } = await supabase
-        .from("odds_api_events")
-        .upsert(chunk, { onConflict: "event_id" });
-      if (error) {
-        rememberError("seed_upsert", error);
-      } else {
-        total += chunk.length;
-        stats.parentUpserts += chunk.length;
-        for (const r of chunk) knownEventIds.add(r.event_id);
-      }
-    }
-    return total;
-  } catch (err) {
-    rememberError("seed", err);
+    res = await fetch(url, { headers: { "accept": "application/json" } });
+  } catch (e) { rememberError(`seed:${sport}:fetch`, e); return 0; }
+  if (!res.ok) {
+    rememberError(`seed:${sport}:http`, new Error(`HTTP ${res.status}`));
     return 0;
   }
+  let json;
+  try { json = await res.json(); } catch (e) { rememberError(`seed:${sport}:json`, e); return 0; }
+
+  const events = Array.isArray(json) ? json : (json?.events ?? json?.data ?? []);
+  if (!Array.isArray(events) || !events.length) { console.log(`[seed] ${sport}: 0 events`); return 0; }
+
+  const rows = events
+    .map(evt => {
+      const home = evt.home ?? evt.home_team ?? "";
+      const away = evt.away ?? evt.away_team ?? "";
+      if (!evt?.id || !home || !away) return null;
+      return {
+        event_id: `${EVENT_ID_PREFIX}${String(evt.id)}`,
+        sport_key: String(evt.sport?.slug ?? evt.sport_key ?? sport),
+        sport_title: evt.sport?.name ?? evt.sport_title ?? evt.league?.name ?? null,
+        commence_time: safeIso(evt.date ?? evt.commence_time),
+        home_team: String(home),
+        away_team: String(away),
+        is_live: isLive(evt.status ?? evt.in_play),
+        last_seen_at: new Date().toISOString(),
+      };
+    })
+    .filter(Boolean);
+
+  console.log(`[seed] ${sport}: ${rows.length} events`);
+
+  let upserted = 0;
+  for (let i = 0; i < rows.length; i += UPSERT_CHUNK) {
+    const chunk = rows.slice(i, i + UPSERT_CHUNK);
+    const { error } = await supabase
+      .from("odds_api_events")
+      .upsert(chunk, { onConflict: "event_id" });
+    if (error) { rememberError(`seed:${sport}:upsert`, error); continue; }
+    upserted += chunk.length;
+    for (const r of chunk) knownEventIds.add(r.event_id);
+  }
+  stats.parentUpserts += upserted;
+  return upserted;
 }
 
 async function seedAllSports() {
-  stats.seedRuns += 1;
-  console.log(`[seed#${stats.seedRuns}] start for ${SPORTS.length} sports`);
-  let grand = 0;
+  seedRun += 1;
+  console.log(`[seed#${seedRun}] start for ${SPORTS.length} sports`);
+  let total = 0;
   for (const sport of SPORTS) {
-    const n = await seedEventsForSport(sport);
-    if (n) {
-      grand += n;
-      console.log(`[seed] ${sport}: ${n} events`);
-    }
+    total += await seedEventsForSport(sport);
   }
-  stats.lastSeedAt = new Date().toISOString();
-  console.log(`[seed#${stats.seedRuns}] done — ${grand} total upserts, known=${knownEventIds.size}`);
+  console.log(`[seed#${seedRun}] done — ${total} total upserts, known=${knownEventIds.size}`);
 }
 
-// ─── Parent row (odds_api_events) — best-effort from WS payload ───────────
-async function upsertEventRow(evt) {
-  if (!evt?.id) return;
-  const home = String(evt.home ?? evt.home_team ?? "");
-  const away = String(evt.away ?? evt.away_team ?? "");
-  const sportKey = String(evt.sport?.slug ?? evt.sport_key ?? "");
-  // WS odds messages don't include teams; skip parent insert. The REST
-  // seeder handles parent rows. If FK still fails we just drop the odds.
-  if (!sportKey || !home || !away) return;
-
-  const row = {
-    event_id: `${EVENT_ID_PREFIX}${String(evt.id)}`,
-    sport_key: sportKey,
-    sport_title: evt.sport?.name ?? evt.sport_title ?? evt.league?.name ?? null,
-    commence_time: safeIso(evt.date ?? evt.commence_time),
-    home_team: home,
-    away_team: away,
-    is_live: isLive(evt.status ?? evt.in_play),
-    last_seen_at: new Date().toISOString(),
-  };
-
-  const { error } = await supabase
-    .from("odds_api_events")
-    .upsert([row], { onConflict: "event_id" });
-  if (error) {
-    rememberError("parent_upsert", error);
-    return;
-  }
-  stats.parentUpserts += 1;
-  knownEventIds.add(row.event_id);
-}
-
-// ─── Flatten WS event to live_odds rows ───────────────────────────────────
+// ─── Flatten WS event ─────────────────────────────────────────────────────
 function flattenEvent(evt) {
   if (!evt?.id || !Array.isArray(evt.markets)) return [];
   const bookmaker = String(evt.bookie ?? evt.bookmaker ?? "");
@@ -288,9 +235,7 @@ function flattenEvent(evt) {
     const pt = Number(point ?? 0);
     if (!Number.isFinite(p) || p <= 1) return;
     rows.push({
-      event_id: eventId,
-      bookmaker,
-      market,
+      event_id: eventId, bookmaker, market,
       selection: String(selection),
       price: p,
       point: Number.isFinite(pt) ? pt : 0,
@@ -309,21 +254,21 @@ function flattenEvent(evt) {
     for (const odd of market.odds ?? []) {
       if (baseType === "h2h") {
         pushRow({ market: dbMarket, selection: homeName, price: odd.home, providerTs });
-        pushRow({ market: dbMarket, selection: "Draw", price: odd.draw, providerTs });
+        pushRow({ market: dbMarket, selection: "Draw",   price: odd.draw, providerTs });
         pushRow({ market: dbMarket, selection: awayName, price: odd.away, providerTs });
       } else if (baseType === "spreads") {
         const point = Number(odd.hcp ?? odd.handicap ?? odd.point);
         if (!Number.isFinite(point)) continue;
-        pushRow({ market: dbMarket, selection: homeName, price: odd.home, point, providerTs });
-        pushRow({ market: dbMarket, selection: awayName, price: odd.away, point: -point, providerTs });
+        pushRow({ market: dbMarket, selection: homeName, price: odd.home, point,       providerTs });
+        pushRow({ market: dbMarket, selection: awayName, price: odd.away, point:-point, providerTs });
       } else if (baseType === "totals") {
         const point = Number(odd.total ?? odd.hdp ?? odd.point);
         if (!Number.isFinite(point)) continue;
-        pushRow({ market: dbMarket, selection: "Over", price: odd.over, point, providerTs });
+        pushRow({ market: dbMarket, selection: "Over",  price: odd.over,  point, providerTs });
         pushRow({ market: dbMarket, selection: "Under", price: odd.under, point, providerTs });
       } else if (baseType === "btts") {
         pushRow({ market: dbMarket, selection: "Yes", price: odd.yes ?? odd.Yes, providerTs });
-        pushRow({ market: dbMarket, selection: "No", price: odd.no ?? odd.No, providerTs });
+        pushRow({ market: dbMarket, selection: "No",  price: odd.no  ?? odd.No,  providerTs });
       } else if (baseType === "double_chance") {
         pushRow({ market: dbMarket, selection: "1X", price: odd.homeDraw ?? odd["1X"] ?? odd.home_draw, providerTs });
         pushRow({ market: dbMarket, selection: "12", price: odd.homeAway ?? odd["12"] ?? odd.home_away, providerTs });
@@ -337,12 +282,12 @@ function flattenEvent(evt) {
         const side = String(odd.team ?? odd.side ?? "").toLowerCase();
         const teamName = side === "home" ? homeName : side === "away" ? awayName : null;
         if (teamName) {
-          pushRow({ market: dbMarket, selection: `${teamName} Over`, price: odd.over, point, providerTs });
+          pushRow({ market: dbMarket, selection: `${teamName} Over`,  price: odd.over,  point, providerTs });
           pushRow({ market: dbMarket, selection: `${teamName} Under`, price: odd.under, point, providerTs });
         } else {
-          pushRow({ market: dbMarket, selection: `${homeName} Over`, price: odd.home_over, point, providerTs });
+          pushRow({ market: dbMarket, selection: `${homeName} Over`,  price: odd.home_over,  point, providerTs });
           pushRow({ market: dbMarket, selection: `${homeName} Under`, price: odd.home_under, point, providerTs });
-          pushRow({ market: dbMarket, selection: `${awayName} Over`, price: odd.away_over, point, providerTs });
+          pushRow({ market: dbMarket, selection: `${awayName} Over`,  price: odd.away_over,  point, providerTs });
           pushRow({ market: dbMarket, selection: `${awayName} Under`, price: odd.away_under, point, providerTs });
         }
       }
@@ -351,32 +296,45 @@ function flattenEvent(evt) {
   return rows;
 }
 
+// ─── Handle one WS event ──────────────────────────────────────────────────
 async function handleEvent(evt) {
-  // Best-effort parent upsert from WS payload (no-op for plain odds messages).
-  await upsertEventRow(evt);
+  if (!evt?.id) return;
+  const eventId = `${EVENT_ID_PREFIX}${String(evt.id)}`;
+
+  // Skip until parent row exists (created by seeder)
+  if (!knownEventIds.has(eventId)) return;
 
   const rows = flattenEvent(evt);
   if (!rows.length) return;
 
-  const eventId = rows[0].event_id;
+  // Deterministic order → concurrent upserts lock rows in same sequence → no deadlock
+  rows.sort((a, b) => {
+    if (a.event_id  !== b.event_id)  return a.event_id  < b.event_id  ? -1 : 1;
+    if (a.bookmaker !== b.bookmaker) return a.bookmaker < b.bookmaker ? -1 : 1;
+    if (a.market    !== b.market)    return a.market    < b.market    ? -1 : 1;
+    if (a.selection !== b.selection) return a.selection < b.selection ? -1 : 1;
+    return a.point - b.point;
+  });
 
-  // Skip live_odds upsert if we haven't seeded this event yet — avoids
-  // FK-violation log spam. Once the periodic seeder picks it up, the next
-  // odds message will land.
-  if (!knownEventIds.has(eventId)) return;
-
-  const { error } = await supabase
-    .from("live_odds")
-    .upsert(rows, { onConflict: "event_id,bookmaker,market,selection,point" });
-  if (error) {
-    // FK race (seeder hasn't caught it yet) — drop from cache so we retry later.
-    if (error.code === "23503") {
-      knownEventIds.delete(eventId);
-      return;
+  let error;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await supabase
+      .from("live_odds")
+      .upsert(rows, { onConflict: "event_id,bookmaker,market,selection,point" });
+    error = res.error;
+    if (!error) break;
+    if (error.code === "40P01") {                          // deadlock — retry
+      stats.deadlockRetries += 1;
+      await sleep(50 + Math.random() * 150 * (attempt + 1));
+      continue;
     }
-    rememberError("live_odds_upsert", error);
-    return;
+    if (error.code === "23503") {                          // FK race → drop from cache, reseeder will restore
+      knownEventIds.delete(eventId);
+    }
+    break;
   }
+  if (error) { rememberError("live_odds_upsert", error); return; }
+
   stats.upserts += rows.length;
   stats.lastUpsertAt = new Date().toISOString();
 }
@@ -392,76 +350,67 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(connect, delay);
 }
 
+function parseFrame(text) {
+  const payloads = [];
+  const tryParse = (chunk) => {
+    try { payloads.push(JSON.parse(chunk)); return true; } catch { return false; }
+  };
+  if (tryParse(text)) return payloads;
+
+  for (const line of text.split(/\r?\n/).map(p => p.trim()).filter(Boolean)) {
+    if (tryParse(line)) continue;
+    let depth = 0, start = -1, inString = false, escaped = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (start === -1) { if (/\s/.test(ch)) continue; start = i; }
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === "\\") escaped = true;
+        else if (ch === '"') inString = false;
+        continue;
+      }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === "{" || ch === "[") depth++;
+      if (ch === "}" || ch === "]") {
+        depth--;
+        if (depth === 0 && start !== -1) { tryParse(line.slice(start, i + 1)); start = -1; }
+      }
+    }
+  }
+  return payloads;
+}
+
 function connect() {
   if (shuttingDown) return;
   console.log(`[ws] connecting key=${KEY_FINGERPRINT} sports=${SPORTS.length} markets=${MARKETS.length}`);
-
   ws = new WebSocket(WS_URL);
 
-  ws.on("open", () => {
-    console.log("[ws] open");
-    backoffIdx = 0;
-    lastMessageAt = Date.now();
-  });
+  ws.on("open", () => { console.log("[ws] open"); backoffIdx = 0; lastMessageAt = Date.now(); });
 
-  ws.on("message", async (data) => {
+  ws.on("message", (data) => {
     lastMessageAt = Date.now();
     stats.messages += 1;
 
-    const text = data.toString().trim();
-    if (!text) return;
+    // Serialize: process this message only after the previous one finished
+    processingChain = processingChain.then(async () => {
+      const text = data.toString().trim();
+      if (!text) return;
 
-    const payloads = [];
-    const tryParse = (chunk) => {
-      try { payloads.push(JSON.parse(chunk)); return true; } catch { return false; }
-    };
-
-    if (!tryParse(text)) {
-      for (const line of text.split(/\r?\n/).map((p) => p.trim()).filter(Boolean)) {
-        if (tryParse(line)) continue;
-
-        let depth = 0, start = -1, inString = false, escaped = false;
-        for (let i = 0; i < line.length; i += 1) {
-          const ch = line[i];
-          if (start === -1) {
-            if (/\s/.test(ch)) continue;
-            start = i;
-          }
-          if (inString) {
-            if (escaped) escaped = false;
-            else if (ch === "\\") escaped = true;
-            else if (ch === '"') inString = false;
-            continue;
-          }
-          if (ch === '"') { inString = true; continue; }
-          if (ch === "{" || ch === "[") depth += 1;
-          if (ch === "}" || ch === "]") {
-            depth -= 1;
-            if (depth === 0 && start !== -1) {
-              tryParse(line.slice(start, i + 1));
-              start = -1;
-            }
-          }
-        }
+      const payloads = parseFrame(text);
+      if (!payloads.length) {
+        stats.parseErrors += 1;
+        rememberError("parse", new Error(`Could not parse WS frame (${text.length} chars)`),
+          { quiet: stats.parseErrors > 5 && stats.parseErrors % 100 !== 0 });
+        return;
       }
-    }
 
-    if (!payloads.length) {
-      stats.parseErrors += 1;
-      rememberError(
-        "parse",
-        new Error(`Could not parse websocket frame (${text.length} chars)`),
-        { quiet: stats.parseErrors > 5 && stats.parseErrors % 100 !== 0 },
-      );
-      return;
-    }
-
-    for (const payload of payloads) {
-      const events = Array.isArray(payload?.events)
-        ? payload.events
-        : (payload?.id ? [payload] : []);
-      for (const evt of events) await handleEvent(evt);
-    }
+      for (const payload of payloads) {
+        const events = Array.isArray(payload?.events)
+          ? payload.events
+          : (payload?.id ? [payload] : []);
+        for (const evt of events) await handleEvent(evt);
+      }
+    }).catch((e) => rememberError("chain", e));
   });
 
   ws.on("close", (code, reason) => {
@@ -489,8 +438,8 @@ setInterval(() => {
   console.log(
     `[metrics] msgs=${stats.messages} upserts=${stats.upserts} `
     + `parent=${stats.parentUpserts} known=${knownEventIds.size} `
-    + `errors=${stats.errors} reconnects=${stats.reconnects} `
-    + `wsOpen=${ws?.readyState === WebSocket.OPEN}`
+    + `errors=${stats.errors} deadlockRetries=${stats.deadlockRetries} `
+    + `reconnects=${stats.reconnects} wsOpen=${ws?.readyState === WebSocket.OPEN}`
   );
 }, METRICS_INTERVAL_MS);
 
@@ -525,15 +474,13 @@ function shutdown(sig) {
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT",  () => shutdown("SIGINT"));
-process.on("uncaughtException", (e) => { rememberError("uncaught", e); });
-process.on("unhandledRejection", (e) => { rememberError("unhandled", e); });
+process.on("uncaughtException", (e) => rememberError("uncaught", e));
+process.on("unhandledRejection", (e) => rememberError("unhandled", e));
 
 // ─── Boot ─────────────────────────────────────────────────────────────────
 console.log(`[boot] starting odds-api-bridge v${VERSION} key=${KEY_FINGERPRINT}`);
-
-// Seed first, then open WS — this primes knownEventIds before odds arrive.
 (async () => {
-  await seedAllSports();
+  await seedAllSports();        // populate parent rows first
   setInterval(seedAllSports, SEED_INTERVAL_MS);
-  connect();
-})();
+  connect();                     // then open WS
+})().catch(e => { rememberError("boot", e); process.exit(1); });
