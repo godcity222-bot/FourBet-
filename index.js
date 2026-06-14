@@ -10,6 +10,11 @@ import crypto from "node:crypto";
 import WebSocket from "ws";
 import { createClient } from "@supabase/supabase-js";
 
+// Polyfill native WebSocket for Node < 22 (Supabase realtime requires it)
+if (!globalThis.WebSocket) {
+  globalThis.WebSocket = WebSocket;
+}
+
 // ─── Config ───────────────────────────────────────────────────────────────
 const required = (name) => {
   const v = process.env[name];
@@ -24,7 +29,7 @@ const ODDS_API_KEY              = required("ODDS_API_IO_KEY");
 const SUPABASE_URL              = required("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = required("SUPABASE_SERVICE_ROLE_KEY");
 const PORT                      = Number(process.env.PORT ?? 3000);
-const VERSION                   = "2.0.0";
+const VERSION                   = "2.0.1";
 
 const KEY_FINGERPRINT = crypto.createHash("sha256")
   .update(ODDS_API_KEY).digest("hex").slice(0, 8);
