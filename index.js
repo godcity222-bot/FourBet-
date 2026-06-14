@@ -1,8 +1,9 @@
 /**
- * odds-api-bridge v2
+ * odds-api-bridge v2.0.4
  *
- * Single persistent WebSocket from odds-api.io -> Supabase upserts.
- * Stateless, restart-safe, designed for Railway / Fly / any Node 20+ host.
+ * Single persistent WebSocket from odds-api.io -> Supabase upserts,
+ * plus a periodic REST seeder so live_odds inserts always satisfy
+ * the odds_api_events FK.
  */
 
 import http from "node:http";
@@ -25,7 +26,7 @@ const ODDS_API_KEY              = required("ODDS_API_IO_KEY");
 const SUPABASE_URL              = required("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = required("SUPABASE_SERVICE_ROLE_KEY");
 const PORT                      = Number(process.env.PORT ?? 3000);
-const VERSION                   = "2.0.3";
+const VERSION                   = "2.0.4";
 
 const KEY_FINGERPRINT = crypto.createHash("sha256")
   .update(ODDS_API_KEY).digest("hex").slice(0, 8);
@@ -36,11 +37,7 @@ const SPORTS = (process.env.SPORTS ?? [
   "ice-hockey", "mixed-martial-arts", "boxing", "rugby", "cricket",
 ].join(",")).split(",").map(s => s.trim()).filter(Boolean);
 
-// Default to the full set the UI knows how to render. Player props are
-// intentionally omitted until the flattener understands their payload shape.
-// Official odds-api.io market names (see docs). Corners come in Totals/Spread
-// variants; cards are exposed as "Bookings". There is NO 1x2 variant for
-// corners or cards, so don't request them.
+// Default to the full set the UI knows how to render.
 const MARKETS = (process.env.MARKETS ??
   "ML,Spread,Totals,BTTS,DC,DNB,ALT_Spread,ALT_Totals,Team_Totals," +
   "H2H_H1,Totals_H1,Spread_H1,BTTS_H1,DC_H1," +
@@ -56,6 +53,7 @@ const EVENT_ID_PREFIX = process.env.EVENT_ID_PREFIX ?? "oddsapi:";
 const BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
 const WATCHDOG_MS = 90_000;
 const METRICS_INTERVAL_MS = 30_000;
+const SEED_INTERVAL_MS = 5 * 60_000; // re-seed events every 5 minutes
 
 // ─── Supabase ─────────────────────────────────────────────────────────────
 if (typeof globalThis.WebSocket === "undefined") {
@@ -73,17 +71,20 @@ let backoffIdx = 0;
 let lastMessageAt = Date.now();
 let shuttingDown = false;
 let reconnectTimer = null;
+const knownEventIds = new Set(); // event_ids that we know exist in odds_api_events
 
 const stats = {
   startedAt: new Date().toISOString(),
   messages: 0,
   upserts: 0,
   parentUpserts: 0,
+  seedRuns: 0,
   errors: 0,
   parseErrors: 0,
   reconnects: 0,
   lastError: null,
   lastUpsertAt: null,
+  lastSeedAt: null,
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -125,9 +126,6 @@ const SUPPORTED_MARKETS = new Set([
   "cards_totals", "cards_spreads",
 ]);
 
-// Markets whose payload is shaped identically to one of the core six but with
-// a different db key (halves, alternates, corners totals). The flattener
-// reuses the core handler by switching on this base type.
 const MARKET_BASE = {
   spreads: "spreads",
   alternate_spreads: "spreads",
@@ -165,11 +163,7 @@ function formatError(err) {
       hint: err.hint ?? null,
       code: err.code ?? null,
     };
-    try {
-      return JSON.stringify(shaped);
-    } catch {
-      return String(err);
-    }
+    try { return JSON.stringify(shaped); } catch { return String(err); }
   }
   return String(err ?? "unknown");
 }
@@ -181,29 +175,99 @@ function rememberError(stage, err, { quiet = false } = {}) {
   if (!quiet) console.error(`[err:${stage}] ${msg}`);
 }
 
-// ─── Parent row (odds_api_events) ─────────────────────────────────────────
+// ─── REST event seeder (populates odds_api_events for FK) ─────────────────
+async function seedEventsForSport(sport) {
+  try {
+    const url = `https://api.odds-api.io/v3/events?apiKey=${encodeURIComponent(ODDS_API_KEY)}&sport=${encodeURIComponent(sport)}&limit=5000`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      rememberError("seed_fetch", new Error(`${sport} HTTP ${res.status}`));
+      return 0;
+    }
+    const events = await res.json();
+    if (!Array.isArray(events) || !events.length) return 0;
+
+    const rows = events
+      .filter((e) => e?.id && (e.home || e.home_team) && (e.away || e.away_team))
+      .map((e) => ({
+        event_id: `${EVENT_ID_PREFIX}${String(e.id)}`,
+        sport_key: String(e.sport?.slug ?? e.sport_key ?? sport),
+        sport_title: e.sport?.name ?? e.league?.name ?? null,
+        commence_time: safeIso(e.date ?? e.commence_time),
+        home_team: String(e.home ?? e.home_team ?? ""),
+        away_team: String(e.away ?? e.away_team ?? ""),
+        is_live: isLive(e.status),
+        last_seen_at: new Date().toISOString(),
+      }));
+
+    if (!rows.length) return 0;
+
+    let total = 0;
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
+      const { error } = await supabase
+        .from("odds_api_events")
+        .upsert(chunk, { onConflict: "event_id" });
+      if (error) {
+        rememberError("seed_upsert", error);
+      } else {
+        total += chunk.length;
+        stats.parentUpserts += chunk.length;
+        for (const r of chunk) knownEventIds.add(r.event_id);
+      }
+    }
+    return total;
+  } catch (err) {
+    rememberError("seed", err);
+    return 0;
+  }
+}
+
+async function seedAllSports() {
+  stats.seedRuns += 1;
+  console.log(`[seed#${stats.seedRuns}] start for ${SPORTS.length} sports`);
+  let grand = 0;
+  for (const sport of SPORTS) {
+    const n = await seedEventsForSport(sport);
+    if (n) {
+      grand += n;
+      console.log(`[seed] ${sport}: ${n} events`);
+    }
+  }
+  stats.lastSeedAt = new Date().toISOString();
+  console.log(`[seed#${stats.seedRuns}] done — ${grand} total upserts, known=${knownEventIds.size}`);
+}
+
+// ─── Parent row (odds_api_events) — best-effort from WS payload ───────────
 async function upsertEventRow(evt) {
   if (!evt?.id) return;
+  const home = String(evt.home ?? evt.home_team ?? "");
+  const away = String(evt.away ?? evt.away_team ?? "");
+  const sportKey = String(evt.sport?.slug ?? evt.sport_key ?? "");
+  // WS odds messages don't include teams; skip parent insert. The REST
+  // seeder handles parent rows. If FK still fails we just drop the odds.
+  if (!sportKey || !home || !away) return;
+
   const row = {
     event_id: `${EVENT_ID_PREFIX}${String(evt.id)}`,
-    sport_key: String(evt.sport?.slug ?? evt.sport_key ?? ""),
+    sport_key: sportKey,
     sport_title: evt.sport?.name ?? evt.sport_title ?? evt.league?.name ?? null,
     commence_time: safeIso(evt.date ?? evt.commence_time),
-    home_team: String(evt.home ?? evt.home_team ?? ""),
-    away_team: String(evt.away ?? evt.away_team ?? ""),
+    home_team: home,
+    away_team: away,
     is_live: isLive(evt.status ?? evt.in_play),
     last_seen_at: new Date().toISOString(),
   };
-  if (!row.sport_key && !row.home_team && !row.away_team) return;
 
   const { error } = await supabase
     .from("odds_api_events")
     .upsert([row], { onConflict: "event_id" });
   if (error) {
     rememberError("parent_upsert", error);
-    throw error;
+    return;
   }
   stats.parentUpserts += 1;
+  knownEventIds.add(row.event_id);
 }
 
 // ─── Flatten WS event to live_odds rows ───────────────────────────────────
@@ -253,7 +317,7 @@ function flattenEvent(evt) {
         pushRow({ market: dbMarket, selection: homeName, price: odd.home, point, providerTs });
         pushRow({ market: dbMarket, selection: awayName, price: odd.away, point: -point, providerTs });
       } else if (baseType === "totals") {
-        const point = Number(odd.total ?? odd.point);
+        const point = Number(odd.total ?? odd.hdp ?? odd.point);
         if (!Number.isFinite(point)) continue;
         pushRow({ market: dbMarket, selection: "Over", price: odd.over, point, providerTs });
         pushRow({ market: dbMarket, selection: "Under", price: odd.under, point, providerTs });
@@ -288,18 +352,28 @@ function flattenEvent(evt) {
 }
 
 async function handleEvent(evt) {
-  try {
-    await upsertEventRow(evt);
-  } catch {
-    return; // parent upsert failed → don't try children (FK)
-  }
+  // Best-effort parent upsert from WS payload (no-op for plain odds messages).
+  await upsertEventRow(evt);
+
   const rows = flattenEvent(evt);
   if (!rows.length) return;
+
+  const eventId = rows[0].event_id;
+
+  // Skip live_odds upsert if we haven't seeded this event yet — avoids
+  // FK-violation log spam. Once the periodic seeder picks it up, the next
+  // odds message will land.
+  if (!knownEventIds.has(eventId)) return;
 
   const { error } = await supabase
     .from("live_odds")
     .upsert(rows, { onConflict: "event_id,bookmaker,market,selection,point" });
   if (error) {
+    // FK race (seeder hasn't caught it yet) — drop from cache so we retry later.
+    if (error.code === "23503") {
+      knownEventIds.delete(eventId);
+      return;
+    }
     rememberError("live_odds_upsert", error);
     return;
   }
@@ -320,7 +394,7 @@ function scheduleReconnect() {
 
 function connect() {
   if (shuttingDown) return;
-  console.log(`[ws] connecting key=${KEY_FINGERPRINT} sports=${SPORTS.length} markets=${MARKETS.join(",")}`);
+  console.log(`[ws] connecting key=${KEY_FINGERPRINT} sports=${SPORTS.length} markets=${MARKETS.length}`);
 
   ws = new WebSocket(WS_URL);
 
@@ -339,45 +413,27 @@ function connect() {
 
     const payloads = [];
     const tryParse = (chunk) => {
-      try {
-        payloads.push(JSON.parse(chunk));
-        return true;
-      } catch {
-        return false;
-      }
+      try { payloads.push(JSON.parse(chunk)); return true; } catch { return false; }
     };
 
     if (!tryParse(text)) {
-      for (const line of text.split(/\r?\n/).map((part) => part.trim()).filter(Boolean)) {
+      for (const line of text.split(/\r?\n/).map((p) => p.trim()).filter(Boolean)) {
         if (tryParse(line)) continue;
 
-        let depth = 0;
-        let start = -1;
-        let inString = false;
-        let escaped = false;
-
+        let depth = 0, start = -1, inString = false, escaped = false;
         for (let i = 0; i < line.length; i += 1) {
           const ch = line[i];
           if (start === -1) {
             if (/\s/.test(ch)) continue;
             start = i;
           }
-
           if (inString) {
-            if (escaped) {
-              escaped = false;
-            } else if (ch === "\\") {
-              escaped = true;
-            } else if (ch === '"') {
-              inString = false;
-            }
+            if (escaped) escaped = false;
+            else if (ch === "\\") escaped = true;
+            else if (ch === '"') inString = false;
             continue;
           }
-
-          if (ch === '"') {
-            inString = true;
-            continue;
-          }
+          if (ch === '"') { inString = true; continue; }
           if (ch === "{" || ch === "[") depth += 1;
           if (ch === "}" || ch === "]") {
             depth -= 1;
@@ -404,10 +460,7 @@ function connect() {
       const events = Array.isArray(payload?.events)
         ? payload.events
         : (payload?.id ? [payload] : []);
-
-      for (const evt of events) {
-        await handleEvent(evt);
-      }
+      for (const evt of events) await handleEvent(evt);
     }
   });
 
@@ -431,12 +484,13 @@ setInterval(() => {
   }
 }, 15_000);
 
-// ─── Metrics log ──────────────────────────────────────────────────────────
+// ─── Metrics ──────────────────────────────────────────────────────────────
 setInterval(() => {
   console.log(
     `[metrics] msgs=${stats.messages} upserts=${stats.upserts} `
-    + `parent=${stats.parentUpserts} errors=${stats.errors} `
-    + `reconnects=${stats.reconnects} wsOpen=${ws?.readyState === WebSocket.OPEN}`
+    + `parent=${stats.parentUpserts} known=${knownEventIds.size} `
+    + `errors=${stats.errors} reconnects=${stats.reconnects} `
+    + `wsOpen=${ws?.readyState === WebSocket.OPEN}`
   );
 }, METRICS_INTERVAL_MS);
 
@@ -451,6 +505,7 @@ http.createServer((req, res) => {
       keyFingerprint: KEY_FINGERPRINT,
       sports: SPORTS,
       markets: MARKETS,
+      knownEvents: knownEventIds.size,
       stats,
     };
     res.writeHead(200, { "content-type": "application/json" });
@@ -475,4 +530,10 @@ process.on("unhandledRejection", (e) => { rememberError("unhandled", e); });
 
 // ─── Boot ─────────────────────────────────────────────────────────────────
 console.log(`[boot] starting odds-api-bridge v${VERSION} key=${KEY_FINGERPRINT}`);
-connect();
+
+// Seed first, then open WS — this primes knownEventIds before odds arrive.
+(async () => {
+  await seedAllSports();
+  setInterval(seedAllSports, SEED_INTERVAL_MS);
+  connect();
+})();
