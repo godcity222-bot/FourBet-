@@ -1,12 +1,12 @@
 {
   "name": "odds-api-bridge",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "type": "module",
   "main": "index.js",
   "scripts": { "start": "node index.js" },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.4",
+    "@supabase/supabase-js": "^2.55.0",
     "ws": "^8.18.0"
   },
-  "engines": { "node": ">=20" }
+  "engines": { "node": "22.x" }
 }
