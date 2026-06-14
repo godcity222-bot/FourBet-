@@ -1,12 +1,17 @@
 {
   "name": "odds-api-bridge",
-  "version": "2.0.1",
+  "version": "2.0.3",
+  "description": "WebSocket bridge: odds-api.io -> Supabase live_odds.",
   "type": "module",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "@supabase/supabase-js": "^2.55.0",
     "ws": "^8.18.0"
   },
-  "engines": { "node": "22.x" }
+  "engines": {
+    "node": "22.x"
+  }
 }
