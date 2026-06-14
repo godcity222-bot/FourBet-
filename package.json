@@ -1,7 +1,7 @@
 {
   "name": "odds-api-bridge",
-  "version": "2.0.3",
-  "description": "WebSocket bridge: odds-api.io -> Supabase live_odds.",
+  "version": "2.0.4",
+  "description": "WebSocket bridge: odds-api.io -> Supabase live_odds, with REST event seeder.",
   "type": "module",
   "main": "index.js",
   "scripts": {
