@@ -883,8 +883,19 @@ async function handleEvent(evt) {
   // only {id, scores, status, timestamp, type} with NO sport field, so the
   // only way to attribute them to a sport is by joining on this cache.
   rememberEventMeta(rawId, evt);
-  const rows = flattenEvent(evt);
-  if (!rows.length) return;
+  const rawRows = flattenEvent(evt);
+  if (!rawRows.length) return;
+
+  // Dedupe by conflict key — Postgres rejects upsert when the same
+  // (event_id, bookmaker, market, selection, point) appears twice in one batch
+  // with "ON CONFLICT DO UPDATE command cannot affect row a second time".
+  // Keep the last occurrence (latest price wins within the frame).
+  const dedup = new Map();
+  for (const r of rawRows) {
+    const k = `${r.event_id}|${r.bookmaker}|${r.market}|${r.selection}|${r.point ?? ""}`;
+    dedup.set(k, r);
+  }
+  const rows = Array.from(dedup.values());
 
   const { error } = await supabase
     .from("live_odds")
