@@ -152,7 +152,7 @@ const EVENT_ID_PREFIX = process.env.EVENT_ID_PREFIX ?? "oddsapi:";
 const BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
 const WATCHDOG_MS = 90_000;
 const METRICS_INTERVAL_MS = 30_000;
-const LIVE_PROVIDER_MAX_AGE_MS = 30_000;
+const LIVE_PROVIDER_MAX_AGE_MS = 8 * 60_000;
 
 // ─── Request Budget / Rate Limiter ────────────────────────────────────────
 // Provider quota is 10,000 req/hour. We target a SOFT cap well below that so
@@ -645,9 +645,11 @@ function flattenEvent(evt) {
     if (!seenMarketNames.has(market.name)) {
       seenMarketNames.add(market.name);
       const sampleOdd = (market.odds ?? [])[0];
-      console.log(`[market-sample] name="${market.name}" dbMarket="${dbMarket}" sampleOdd=${JSON.stringify(sampleOdd)}`);
+      console.log(`[market-sample] name="${market.name}" dbMarket="${dbMarket}" supported=${SUPPORTED_MARKETS.has(dbMarket)} sampleOdd=${JSON.stringify(sampleOdd)}`);
     }
-    // markets gate: OFF — accept every market the provider sends
+    // No whitelist gate — accept ALL markets the provider streams.
+    // Unknown markets fall through to shape-sniffing in the generic branch below.
+
     const baseType = MARKET_BASE[dbMarket] ?? dbMarket;
     const providerTs = market.updatedAt ? safeIso(market.updatedAt) : defaultProviderTs;
 
@@ -695,11 +697,13 @@ function flattenEvent(evt) {
           pushRow({ market: dbMarket, selection: `${awayName} Under`, price: odd.away_under, point, providerTs });
         }
       } else {
-        // Generic listed-selection handler. Covers correct_score, ht_ft,
-        // odd_even (when not yes/no), goalscorers, player props, method of
-        // victory, round betting, set winner, total sets/games, outrights,
-        // and anything else where each `odd` is one selection with its own
-        // price. Defensive — accepts a wide variety of provider field names.
+        // Generic listed-selection handler + shape sniffing for ANY market
+        // the provider streams that we haven't explicitly mapped above.
+        // 1) Named selection shape: {name|selection|label, price|odds, point?}
+        // 2) h2h shape:    {home, draw?, away}
+        // 3) totals shape: {over, under, total|point|line}
+        // 4) spreads shape:{home, away, hdp|hcp|handicap|point}
+        // 5) yes/no shape: {yes, no}
         const sel =
           odd.name ?? odd.selection ?? odd.label ?? odd.outcome ??
           odd.player ?? odd.player_name ?? odd.runner ?? odd.team ??
@@ -718,7 +722,25 @@ function flattenEvent(evt) {
             point: Number.isFinite(point) ? point : 0,
             providerTs,
           });
+        } else if (odd.over != null || odd.under != null) {
+          const pt = Number(odd.total ?? odd.point ?? odd.line ?? odd.hdp ?? 0);
+          if (odd.over  != null) pushRow({ market: dbMarket, selection: "Over",  price: odd.over,  point: pt, providerTs });
+          if (odd.under != null) pushRow({ market: dbMarket, selection: "Under", price: odd.under, point: pt, providerTs });
+        } else if (odd.yes != null || odd.no != null) {
+          if (odd.yes != null) pushRow({ market: dbMarket, selection: "Yes", price: odd.yes, providerTs });
+          if (odd.no  != null) pushRow({ market: dbMarket, selection: "No",  price: odd.no,  providerTs });
+        } else if (odd.home != null || odd.away != null || odd.draw != null) {
+          const hcp = Number(odd.hdp ?? odd.hcp ?? odd.handicap ?? odd.point ?? odd.line ?? odd.spread);
+          if (Number.isFinite(hcp)) {
+            if (odd.home != null) pushRow({ market: dbMarket, selection: homeName, price: odd.home, point:  hcp, providerTs });
+            if (odd.away != null) pushRow({ market: dbMarket, selection: awayName, price: odd.away, point: -hcp, providerTs });
+          } else {
+            if (odd.home != null) pushRow({ market: dbMarket, selection: homeName, price: odd.home, providerTs });
+            if (odd.draw != null) pushRow({ market: dbMarket, selection: "Draw",   price: odd.draw, providerTs });
+            if (odd.away != null) pushRow({ market: dbMarket, selection: awayName, price: odd.away, providerTs });
+          }
         }
+
       }
     }
   }
@@ -895,7 +917,21 @@ async function handleEvent(evt) {
     const k = `${r.event_id}|${r.bookmaker}|${r.market}|${r.selection}|${r.point ?? ""}`;
     dedup.set(k, r);
   }
-  const rows = Array.from(dedup.values());
+  let rows = Array.from(dedup.values());
+
+  // Source-aware merge guard: when this frame is from the REST extended
+  // poller, drop rows whose key was already written by WS with a fresher
+  // provider_ts. WS frames bypass this guard — they always win.
+  if (evt?.__source === "rest") {
+    rows = rows.filter((r) => {
+      const k = `${r.event_id}|${r.bookmaker}|${r.market}|${r.selection}|${r.point ?? ""}`;
+      const wsTs = wsLastTsByKey.get(k);
+      if (wsTs == null) return true;
+      const restTs = new Date(r.provider_ts).getTime();
+      return Number.isFinite(restTs) && restTs >= wsTs;
+    });
+    if (rows.length === 0) return;
+  }
 
   const { error } = await supabase
     .from("live_odds")
@@ -906,6 +942,16 @@ async function handleEvent(evt) {
   }
   stats.upserts += rows.length;
   stats.lastUpsertAt = new Date().toISOString();
+  if (evt?.__source !== "rest") {
+    // Remember WS provider_ts so REST never overwrites with a stale price.
+    for (const r of rows) {
+      const k = `${r.event_id}|${r.bookmaker}|${r.market}|${r.selection}|${r.point ?? ""}`;
+      const tsMs = new Date(r.provider_ts).getTime();
+      if (Number.isFinite(tsMs)) wsLastTsByKey.set(k, tsMs);
+    }
+  } else {
+    stats.restExtendedRowsMerged = (stats.restExtendedRowsMerged ?? 0) + rows.length;
+  }
   // Track when we last received ANY non-h2h market so the watchdog can detect
   // an upstream that quietly stopped pushing secondaries while h2h keeps flowing.
   if (rows.some((r) => r.market !== "h2h")) {
@@ -913,6 +959,143 @@ async function handleEvent(evt) {
     for (const c of connections) c.lastSecondaryMarketAt = ts;
     stats.lastSecondaryMarketAt = new Date().toISOString();
   }
+}
+
+// ─── REST extended-markets merger ─────────────────────────────────────────
+// WS streams the markets the provider promotes per sport; REST /odds/multi
+// returns the full bookmaker catalog including extended/long-tail markets
+// (player props, anytime scorer, method-of-victory, race-to-N, etc.). This
+// loop polls REST for live events and feeds each per-bookmaker block back
+// through handleEvent(), so the SAME flatten + upsert pipeline applies and
+// the SAME (event_id,bookmaker,market,selection,point) conflict key
+// naturally dedupes against the WS stream. wsLastTsByKey (above) additionally
+// guards against a stale REST tick overwriting a fresher WS price.
+const wsLastTsByKey = new Map(); // upsert-key -> provider_ts (ms)
+const WS_TS_KEY_MAX = 200_000;
+
+const REST_EXTENDED_ENABLED   = String(process.env.REST_EXTENDED_ENABLED ?? "true").toLowerCase() !== "false";
+const REST_EXTENDED_POLL_MS   = Number(process.env.REST_EXTENDED_POLL_MS ?? 60_000);
+const REST_EXTENDED_CHUNK     = Number(process.env.REST_EXTENDED_CHUNK ?? 10);
+const REST_EXTENDED_MAX_EVENTS= Number(process.env.REST_EXTENDED_MAX_EVENTS ?? 80);
+const REST_EXTENDED_BASE_URL  = process.env.REST_EXTENDED_BASE_URL ?? "https://api.odds-api.io/v3/odds/multi";
+
+function chunkArr(arr, n) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+}
+
+// Convert REST `{id, home, away, bookmakers: {bookie: [markets]}}` into one
+// synthesized WS-shaped event per bookmaker, then route through handleEvent
+// with __source="rest" so the source-aware guard above can apply.
+async function mergeRestEventThroughWsPath(ev) {
+  if (!ev || ev.id == null || !ev.bookmakers || typeof ev.bookmakers !== "object") return;
+  const baseEvt = {
+    id: ev.id,
+    home: ev.home, away: ev.away,
+    home_team: ev.home, away_team: ev.away,
+    date: ev.date,
+    status: ev.status,
+    sport: ev.sport,
+    sport_key: ev.sport?.slug ?? ev.sport_key,
+    league: ev.league,
+    updatedAt: ev.updatedAt ?? new Date().toISOString(),
+    __source: "rest",
+  };
+  for (const [bookie, markets] of Object.entries(ev.bookmakers)) {
+    if (!Array.isArray(markets) || markets.length === 0) continue;
+    try {
+      await handleEvent({ ...baseEvt, bookie, bookmaker: bookie, markets });
+    } catch (err) {
+      rememberError("rest_merge", err, { quiet: true });
+    }
+  }
+}
+
+async function fetchLiveEventIdsForRest(limit) {
+  const { data, error } = await supabase
+    .from("odds_api_events")
+    .select("event_id, last_seen_at")
+    .eq("is_live", true)
+    .order("last_seen_at", { ascending: false })
+    .limit(limit);
+  if (error) {
+    rememberError("rest_extended:list", error, { quiet: true });
+    return [];
+  }
+  const ids = [];
+  for (const row of data ?? []) {
+    const eid = String(row.event_id ?? "");
+    const raw = eid.startsWith(EVENT_ID_PREFIX) ? eid.slice(EVENT_ID_PREFIX.length) : eid;
+    if (raw) ids.push(raw);
+  }
+  return ids;
+}
+
+let restExtendedPassNum = 0;
+async function runRestExtendedPass() {
+  if (shuttingDown) return;
+  restExtendedPassNum += 1;
+  const ids = await fetchLiveEventIdsForRest(REST_EXTENDED_MAX_EVENTS);
+  if (ids.length === 0) {
+    stats.restExtendedLastSkippedReason = "no_live_events";
+    return;
+  }
+  let mergedEvents = 0;
+  let httpCalls = 0;
+  for (const chunk of chunkArr(ids, REST_EXTENDED_CHUNK)) {
+    if (shuttingDown) break;
+    const url = `${REST_EXTENDED_BASE_URL}?eventIds=${chunk.join(",")}&apiKey=${ODDS_API_KEY}`;
+    let res;
+    try {
+      res = await budgetedFetch(url, {
+        priority: PRIORITY.normal,
+        endpoint: "v3/odds/multi",
+        sport: "mixed",
+        init: { headers: { accept: "application/json" } },
+      });
+    } catch (err) {
+      if (err?.code !== "BUDGET_DENIED") rememberError("rest_extended:fetch", err, { quiet: true });
+      continue;
+    }
+    httpCalls += 1;
+    if (!res.ok) {
+      if (res.status === 429) stats.rateLimited429Count += 1;
+      rememberError("rest_extended:http", new Error(`HTTP ${res.status}`), { quiet: true });
+      continue;
+    }
+    let payload;
+    try { payload = await res.json(); }
+    catch (err) { rememberError("rest_extended:parse", err, { quiet: true }); continue; }
+    const events = Array.isArray(payload) ? payload : (Array.isArray(payload?.events) ? payload.events : []);
+    for (const ev of events) {
+      await mergeRestEventThroughWsPath(ev);
+      mergedEvents += 1;
+    }
+  }
+  stats.restExtendedPasses = (stats.restExtendedPasses ?? 0) + 1;
+  stats.restExtendedLastRunAt = new Date().toISOString();
+  stats.restExtendedLastEventsMerged = mergedEvents;
+  stats.restExtendedLastHttpCalls = httpCalls;
+  if (wsLastTsByKey.size > WS_TS_KEY_MAX) {
+    const drop = Math.ceil(WS_TS_KEY_MAX * 0.1);
+    let i = 0;
+    for (const k of wsLastTsByKey.keys()) {
+      wsLastTsByKey.delete(k);
+      if (++i >= drop) break;
+    }
+  }
+  console.log(`[rest-extended#${restExtendedPassNum}] events=${ids.length} merged=${mergedEvents} httpCalls=${httpCalls}`);
+}
+
+if (REST_EXTENDED_ENABLED) {
+  console.log(`[rest-extended] enabled — poll every ${REST_EXTENDED_POLL_MS}ms, chunk=${REST_EXTENDED_CHUNK}, maxEvents=${REST_EXTENDED_MAX_EVENTS}`);
+  setTimeout(async function loop() {
+    if (shuttingDown) return;
+    try { await runRestExtendedPass(); } catch (err) { rememberError("rest_extended:loop", err, { quiet: true }); }
+    if (shuttingDown) return;
+    setTimeout(loop, REST_EXTENDED_POLL_MS);
+  }, 20_000);
 }
 
 // ─── Event meta cache (id → sport) for score/status enrichment ───────────
