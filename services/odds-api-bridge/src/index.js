@@ -1098,6 +1098,111 @@ if (REST_EXTENDED_ENABLED) {
   }, 20_000);
 }
 
+// ─── Football + Basketball: fetchAllMarkets dedicated poller ──────────────
+// The generic /odds/multi loop above runs sport-agnostic at 60s. Football and
+// basketball have the richest long-tail catalogs (player props, race-to-N,
+// alt lines, asian handicaps, method-of-victory), so we additionally poll
+// those two sports on a tighter cadence with `markets=all` to pull every
+// market the provider exposes per event. Results flow through the same
+// mergeRestEventThroughWsPath path so dedupe + WS-freshness guard apply.
+const ALL_MARKETS_ENABLED   = String(process.env.ALL_MARKETS_ENABLED ?? "true").toLowerCase() !== "false";
+const ALL_MARKETS_POLL_MS   = Number(process.env.ALL_MARKETS_POLL_MS ?? 45_000);
+const ALL_MARKETS_CHUNK     = Number(process.env.ALL_MARKETS_CHUNK ?? 8);
+const ALL_MARKETS_MAX_EVENTS= Number(process.env.ALL_MARKETS_MAX_EVENTS ?? 60);
+const ALL_MARKETS_SPORTS    = (process.env.ALL_MARKETS_SPORTS ?? "soccer,football,basketball")
+  .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const ALL_MARKETS_BASE_URL  = process.env.ALL_MARKETS_BASE_URL ?? "https://api.odds-api.io/v3/odds/multi";
+
+async function fetchLiveEventIdsBySport(sports, limit) {
+  const { data, error } = await supabase
+    .from("odds_api_events")
+    .select("event_id, sport_key, last_seen_at")
+    .eq("is_live", true)
+    .order("last_seen_at", { ascending: false })
+    .limit(limit * 3);
+  if (error) {
+    rememberError("all_markets:list", error, { quiet: true });
+    return [];
+  }
+  const out = [];
+  for (const row of data ?? []) {
+    const sk = String(row.sport_key ?? "").toLowerCase();
+    if (!sports.some((s) => sk.includes(s))) continue;
+    const eid = String(row.event_id ?? "");
+    const raw = eid.startsWith(EVENT_ID_PREFIX) ? eid.slice(EVENT_ID_PREFIX.length) : eid;
+    if (raw) out.push(raw);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+// Pulls the full per-event market catalog from the provider. `markets=all`
+// tells odds-api.io to return every market it has for the event(s), bypassing
+// the default per-sport curated subset that the WS stream is limited to.
+async function fetchAllMarkets(eventIds) {
+  if (!Array.isArray(eventIds) || eventIds.length === 0) return [];
+  const url = `${ALL_MARKETS_BASE_URL}?eventIds=${eventIds.join(",")}&markets=all&apiKey=${ODDS_API_KEY}`;
+  let res;
+  try {
+    res = await budgetedFetch(url, {
+      priority: PRIORITY.normal,
+      endpoint: "v3/odds/multi?markets=all",
+      sport: "football_basketball",
+      init: { headers: { accept: "application/json" } },
+    });
+  } catch (err) {
+    if (err?.code !== "BUDGET_DENIED") rememberError("all_markets:fetch", err, { quiet: true });
+    return [];
+  }
+  if (!res.ok) {
+    if (res.status === 429) stats.rateLimited429Count += 1;
+    rememberError("all_markets:http", new Error(`HTTP ${res.status}`), { quiet: true });
+    return [];
+  }
+  let payload;
+  try { payload = await res.json(); }
+  catch (err) { rememberError("all_markets:parse", err, { quiet: true }); return []; }
+  return Array.isArray(payload) ? payload : (Array.isArray(payload?.events) ? payload.events : []);
+}
+
+let allMarketsPassNum = 0;
+async function runAllMarketsPass() {
+  if (shuttingDown) return;
+  allMarketsPassNum += 1;
+  const ids = await fetchLiveEventIdsBySport(ALL_MARKETS_SPORTS, ALL_MARKETS_MAX_EVENTS);
+  if (ids.length === 0) {
+    stats.allMarketsLastSkippedReason = "no_live_events";
+    return;
+  }
+  let mergedEvents = 0;
+  let httpCalls = 0;
+  for (const chunk of chunkArr(ids, ALL_MARKETS_CHUNK)) {
+    if (shuttingDown) break;
+    const events = await fetchAllMarkets(chunk);
+    httpCalls += 1;
+    for (const ev of events) {
+      await mergeRestEventThroughWsPath(ev);
+      mergedEvents += 1;
+    }
+  }
+  stats.allMarketsPasses = (stats.allMarketsPasses ?? 0) + 1;
+  stats.allMarketsLastRunAt = new Date().toISOString();
+  stats.allMarketsLastEventsMerged = mergedEvents;
+  stats.allMarketsLastHttpCalls = httpCalls;
+  console.log(`[all-markets#${allMarketsPassNum}] sports=${ALL_MARKETS_SPORTS.join("+")} events=${ids.length} merged=${mergedEvents} httpCalls=${httpCalls}`);
+}
+
+if (ALL_MARKETS_ENABLED) {
+  console.log(`[all-markets] enabled — sports=${ALL_MARKETS_SPORTS.join("+")} poll every ${ALL_MARKETS_POLL_MS}ms, chunk=${ALL_MARKETS_CHUNK}, maxEvents=${ALL_MARKETS_MAX_EVENTS}`);
+  setTimeout(async function loop() {
+    if (shuttingDown) return;
+    try { await runAllMarketsPass(); } catch (err) { rememberError("all_markets:loop", err, { quiet: true }); }
+    if (shuttingDown) return;
+    setTimeout(loop, ALL_MARKETS_POLL_MS);
+  }, 30_000);
+}
+
+
 // ─── Event meta cache (id → sport) for score/status enrichment ───────────
 // score/status frames look like {id, scores, status, timestamp, type} — no
 // sport, no league, no teams. To know which sport a frame belongs to we
