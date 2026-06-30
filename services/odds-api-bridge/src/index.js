@@ -645,9 +645,9 @@ function flattenEvent(evt) {
     if (!seenMarketNames.has(market.name)) {
       seenMarketNames.add(market.name);
       const sampleOdd = (market.odds ?? [])[0];
-      console.log(`[market-sample] name="${market.name}" dbMarket="${dbMarket}" supported=${SUPPORTED_MARKETS.has(dbMarket)} sampleOdd=${JSON.stringify(sampleOdd)}`);
+      console.log(`[market-sample] name="${market.name}" dbMarket="${dbMarket}" sampleOdd=${JSON.stringify(sampleOdd)}`);
     }
-    if (!SUPPORTED_MARKETS.has(dbMarket)) continue;
+    // markets gate: OFF — accept every market the provider sends
     const baseType = MARKET_BASE[dbMarket] ?? dbMarket;
     const providerTs = market.updatedAt ? safeIso(market.updatedAt) : defaultProviderTs;
 
