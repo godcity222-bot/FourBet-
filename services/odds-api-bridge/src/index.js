@@ -1108,7 +1108,7 @@ if (REST_EXTENDED_ENABLED) {
 const ALL_MARKETS_ENABLED   = String(process.env.ALL_MARKETS_ENABLED ?? "true").toLowerCase() !== "false";
 const ALL_MARKETS_POLL_MS   = Number(process.env.ALL_MARKETS_POLL_MS ?? 45_000);
 const ALL_MARKETS_CHUNK     = Number(process.env.ALL_MARKETS_CHUNK ?? 8);
-const ALL_MARKETS_MAX_EVENTS= Number(process.env.ALL_MARKETS_MAX_EVENTS ?? 60);
+const ALL_MARKETS_MAX_EVENTS= Number(process.env.ALL_MARKETS_MAX_EVENTS ?? 120);
 const ALL_MARKETS_SPORTS    = (process.env.ALL_MARKETS_SPORTS ?? "soccer,football,basketball")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 const ALL_MARKETS_BASE_URL  = process.env.ALL_MARKETS_BASE_URL ?? "https://api.odds-api.io/v3/odds/multi";
