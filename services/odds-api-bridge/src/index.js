@@ -346,10 +346,16 @@ const PROVIDER_MARKET_MAP = {
   alternative_asian_handicap: "alternate_spreads",
   totals: "totals",
   "goals_over/under": "totals",
-  alt_totals: "alternate_totals",
-  alternate_totals: "alternate_totals",
-  alternative_total_goals: "alternate_totals",
-  alternative_goal_line: "alternate_totals",
+  // Batch L5 P1 — Fold provider `alternate_totals` (and its sibling names)
+  // into canonical `totals` so downstream OU guard / liveSafety /
+  // oddsValidation / settlement all see one bucket. The bridge already
+  // shape-flattens both to Over/Under rows keyed by point; the DB upsert
+  // dedups identical (event, bookmaker, market, selection, point) rows
+  // by primary key so folding cannot double-count.
+  alt_totals: "totals",
+  alternate_totals: "totals",
+  alternative_total_goals: "totals",
+  alternative_goal_line: "totals",
   team_totals: "team_totals",
   tt: "team_totals",
   team_total_goals_home: "team_totals",
@@ -440,6 +446,19 @@ const PROVIDER_MARKET_MAP = {
   "1st_set_winner": "set_winner_s1",
   "2nd_set_winner": "set_winner_s2",
   "3rd_set_winner": "set_winner_s3",
+  // Batch L5 P2 — Aliases: provider also emits per-set winner rows as
+  // `ml_Nth_set` (moneyline of set N). Bind directly to the same
+  // canonical set_winner_sN key so the existing SET_WINNER guard,
+  // liveSafety resolver, oddsValidation resolver, and settlement path
+  // pick them up with no additional wiring. `ml_ht` intentionally not
+  // aliased — its "half-time" semantics in tennis is ambiguous across
+  // best-of-3 vs best-of-5 (could mean "leader after set 1" or "leader
+  // after N/2 sets"); held until we confirm the provider's exact rule.
+  ml_1st_set: "set_winner_s1",
+  ml_2nd_set: "set_winner_s2",
+  ml_3rd_set: "set_winner_s3",
+  ml_4th_set: "set_winner_s4",
+  ml_5th_set: "set_winner_s5",
   total_sets: "total_sets",
   total_games: "total_games",
   correct_set_score: "correct_set_score",
@@ -530,7 +549,7 @@ const LISTED_GENERIC_MARKETS = new Set([
   "highest_scoring_half","highest_scoring_quarter",
   "anytime_scorer","first_scorer","last_scorer",
   "player_score_2plus","player_hattrick",
-  "set_winner","set_winner_s1","set_winner_s2","set_winner_s3",
+  "set_winner","set_winner_s1","set_winner_s2","set_winner_s3","set_winner_s4","set_winner_s5",
   "correct_set_score","player_win_set",
   "player_points","player_rebounds","player_assists",
   "player_threes","player_steals","player_blocks",
@@ -1971,6 +1990,13 @@ const FEATURE_FLAGS = {
   // bracket-placeholder reject for corners_hcp / cards_hcp, and rewrites
   // accepted sides to literal "Home" / "Away".
   spreads_branch_side_hcp_hardened: true,
+  // v2.0.31 (Batch L5) — alt_totals folded into canonical `totals`;
+  // per-set moneyline aliases (`ml_1st_set`..`ml_5th_set`) bound to
+  // `set_winner_sN`. `ml_ht` intentionally NOT aliased.
+  batch_l5_alt_totals_folded: PROVIDER_MARKET_MAP.alternate_totals === "totals",
+  batch_l5_ml_set_aliases_bound:
+    PROVIDER_MARKET_MAP.ml_1st_set === "set_winner_s1" &&
+    PROVIDER_MARKET_MAP.ml_5th_set === "set_winner_s5",
 };
 console.log(`[boot] === odds-api-bridge fingerprint === bridge="odds-api-bridge" version=v${VERSION} node=${process.version} git_sha=${process.env.RAILWAY_GIT_COMMIT_SHA ?? process.env.GIT_SHA ?? "unset"} built_at=${process.env.BUILD_TIMESTAMP ?? "unset"} feature_flags=${JSON.stringify(FEATURE_FLAGS)}`);
 console.log(`[boot] starting odds-api-bridge v${VERSION} file=${import.meta.url} cwd=${process.cwd()} keys=${ODDS_API_KEYS.length} primaryKeyFp=${KEY_FINGERPRINT} ws_connections=${connections.length} sports=${SPORTS.length} marketGroups=${MARKET_GROUPS.length} totalMarkets=${MARKETS.length}`);
