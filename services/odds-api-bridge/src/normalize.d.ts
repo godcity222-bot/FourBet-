@@ -23,3 +23,8 @@ export function normalizeClock(raw: unknown): any;
 export function normalizeScores(raw: unknown): any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function buildBridgeEventRow(evt: unknown, ctx: unknown): any;
+export const PLAYER_PROP_MARKETS: Set<string>;
+export const PLAYER_PROP_TAXONOMY: Record<string, string>;
+export function extractPlayerName(odd: unknown): string | null;
+export function extractOverUnderSide(odd: unknown): 'Over' | 'Under' | 'Yes' | 'No' | null;
+export function buildPlayerPropRows(odd: unknown): Array<{ selection: string; price: number | string; point: number }>;

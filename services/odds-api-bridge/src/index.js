@@ -610,6 +610,8 @@ import {
   SIDE_HANDICAP_MARKETS,
   canonicalizeMatchSide,
   isQuarterLine,
+  PLAYER_PROP_MARKETS,
+  buildPlayerPropRows,
 } from "./normalize.js";
 
 // TRACK A — EXACT/MULTI diagnostics (per-bucket/band ingestion counts).
@@ -799,6 +801,20 @@ function flattenEvent(evt) {
         }
         // else: drop silently — either not a bucket shape (Over/Under, etc.)
         // or a bucket we don't recognize. Counted in bucketDiag.dropped.
+      } else if (PLAYER_PROP_MARKETS.has(dbMarket)) {
+        // Player-prop preserver: encode selection as `${player}|Side` so
+        // the composite PK (event_id, bookmaker, market, selection, point)
+        // stays unique per player+side and the display layer can group by
+        // player. Rows with no extractable player identity are dropped.
+        for (const row of buildPlayerPropRows(odd)) {
+          pushRow({
+            market: dbMarket,
+            selection: row.selection,
+            price: row.price,
+            point: row.point,
+            providerTs,
+          });
+        }
       } else {
         // Generic listed-selection handler + shape sniffing for ANY market
         // the provider streams that we haven't explicitly mapped above.
@@ -1997,6 +2013,12 @@ const FEATURE_FLAGS = {
   batch_l5_ml_set_aliases_bound:
     PROVIDER_MARKET_MAP.ml_1st_set === "set_winner_s1" &&
     PROVIDER_MARKET_MAP.ml_5th_set === "set_winner_s5",
+  // v2.0.33 — player-props bridge preserves player identity in selection
+  // (encoded as `${player}|Over`, `${player}|Under`, `${player}|Yes`,
+  // `${player}|No`, or `${player}` for anytime markets).
+  player_props_bridge_taxonomy: typeof PLAYER_PROP_MARKETS !== "undefined"
+    && PLAYER_PROP_MARKETS.size > 0
+    && typeof buildPlayerPropRows === "function",
 };
 console.log(`[boot] === odds-api-bridge fingerprint === bridge="odds-api-bridge" version=v${VERSION} node=${process.version} git_sha=${process.env.RAILWAY_GIT_COMMIT_SHA ?? process.env.GIT_SHA ?? "unset"} built_at=${process.env.BUILD_TIMESTAMP ?? "unset"} feature_flags=${JSON.stringify(FEATURE_FLAGS)}`);
 console.log(`[boot] starting odds-api-bridge v${VERSION} file=${import.meta.url} cwd=${process.cwd()} keys=${ODDS_API_KEYS.length} primaryKeyFp=${KEY_FINGERPRINT} ws_connections=${connections.length} sports=${SPORTS.length} marketGroups=${MARKET_GROUPS.length} totalMarkets=${MARKETS.length}`);
