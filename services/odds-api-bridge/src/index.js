@@ -2019,6 +2019,13 @@ const FEATURE_FLAGS = {
   player_props_bridge_taxonomy: typeof PLAYER_PROP_MARKETS !== "undefined"
     && PLAYER_PROP_MARKETS.size > 0
     && typeof buildPlayerPropRows === "function",
+  // v2.0.34 — scorer markets (anytime/first/last) routed through the
+  // player-prop extractor so identity is preserved. Bare Yes/No rows
+  // without a player are dropped at the bridge.
+  scorer_markets_routed_via_player_props:
+    PLAYER_PROP_MARKETS.has("anytime_scorer") &&
+    PLAYER_PROP_MARKETS.has("first_scorer") &&
+    PLAYER_PROP_MARKETS.has("last_scorer"),
 };
 console.log(`[boot] === odds-api-bridge fingerprint === bridge="odds-api-bridge" version=v${VERSION} node=${process.version} git_sha=${process.env.RAILWAY_GIT_COMMIT_SHA ?? process.env.GIT_SHA ?? "unset"} built_at=${process.env.BUILD_TIMESTAMP ?? "unset"} feature_flags=${JSON.stringify(FEATURE_FLAGS)}`);
 console.log(`[boot] starting odds-api-bridge v${VERSION} file=${import.meta.url} cwd=${process.cwd()} keys=${ODDS_API_KEYS.length} primaryKeyFp=${KEY_FINGERPRINT} ws_connections=${connections.length} sports=${SPORTS.length} marketGroups=${MARKET_GROUPS.length} totalMarkets=${MARKETS.length}`);

@@ -296,10 +296,16 @@ export function isQuarterLine(point) {
  * ────────────────────────────────────────────────────────────────── */
 
 // Canonical dbMarket names (post-`toDbMarket`) that carry per-player
-// selections. Anytime/first/last scorer are already handled separately
-// (their selection IS the player name), so they are NOT in this set.
+// selections. `anytime_scorer` / `first_scorer` / `last_scorer` are the
+// classic single-side "player named as selection" shape — routing them
+// through buildPlayerPropRows guarantees the extractor drops O/U/Y/N
+// junk rows and encodes identity uniformly.
 export const PLAYER_PROP_MARKETS = new Set([
-  // Soccer
+  // Soccer — scorer markets (anytime/first/last)
+  "anytime_scorer",
+  "first_scorer",
+  "last_scorer",
+  // Soccer — stat props
   "player_shots",
   "player_shots_on_target",
   "player_shots_on_target_outside_box",
@@ -335,8 +341,12 @@ export const PLAYER_PROP_MARKETS = new Set([
   "player_props",
 ]);
 
+
 // Canonical bucket per market — the display layer uses this to group.
 export const PLAYER_PROP_TAXONOMY = {
+  anytime_scorer: "PLAYER_ANYTIME_SCORER",
+  first_scorer: "PLAYER_FIRST_SCORER",
+  last_scorer: "PLAYER_LAST_SCORER",
   player_shots: "PLAYER_SHOTS_OU",
   player_shots_on_target: "PLAYER_SHOTS_ON_TARGET_OU",
   player_shots_on_target_outside_box: "PLAYER_SHOTS_ON_TARGET_OU",
