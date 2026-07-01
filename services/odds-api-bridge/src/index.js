@@ -582,7 +582,27 @@ function rememberError(stage, err, { quiet = false } = {}) {
 }
 
 // ─── Parent row (odds_api_events) ─────────────────────────────────────────
-import { buildBridgeEventRow, normalizeClock } from "./normalize.js";
+import {
+  buildBridgeEventRow,
+  normalizeClock,
+  BUCKET_MARKETS,
+  normalizeBucketSelection,
+  makeBucketDiagnostics,
+  SIDE_HANDICAP_MARKETS,
+  canonicalizeMatchSide,
+  isQuarterLine,
+} from "./normalize.js";
+
+// TRACK A — EXACT/MULTI diagnostics (per-bucket/band ingestion counts).
+const bucketDiag = makeBucketDiagnostics();
+let lastBucketDiagLog = 0;
+const BUCKET_DIAG_INTERVAL_MS = 60_000;
+function maybeLogBucketDiag() {
+  const now = Date.now();
+  if (now - lastBucketDiagLog < BUCKET_DIAG_INTERVAL_MS) return;
+  lastBucketDiagLog = now;
+  console.log(`[bucket-diag] ${JSON.stringify(bucketDiag.snapshot())}`);
+}
 
 async function upsertEventRow(evt) {
   const row = buildBridgeEventRow(evt, {
@@ -661,6 +681,10 @@ function flattenEvent(evt) {
       } else if (baseType === "spreads") {
         const point = Number(odd.hdp ?? odd.hcp ?? odd.handicap ?? odd.point ?? odd.line ?? odd.spread);
         if (!Number.isFinite(point)) continue;
+        // TRACK B — for corners_hcp / cards_hcp, drop quarter-lines at
+        // ingestion (policy: integer + .5 only). Belt-and-suspenders with
+        // the resolver-level reject.
+        if (SIDE_HANDICAP_MARKETS.has(dbMarket) && isQuarterLine(point)) continue;
         const homePrice = odd.home ?? odd.homeOdds ?? odd.home_price ?? odd.h;
         const awayPrice = odd.away ?? odd.awayOdds ?? odd.away_price ?? odd.a;
         pushRow({ market: dbMarket, selection: homeName, price: homePrice, point, providerTs });
@@ -696,6 +720,31 @@ function flattenEvent(evt) {
           pushRow({ market: dbMarket, selection: `${awayName} Over`, price: odd.away_over, point, providerTs });
           pushRow({ market: dbMarket, selection: `${awayName} Under`, price: odd.away_under, point, providerTs });
         }
+      } else if (BUCKET_MARKETS.has(dbMarket)) {
+        // TRACK A — EXACT_GOALS / MULTI_GOALS bucket handler.
+        // These markets are discrete buckets/bands, NOT Over/Under lines.
+        // Only accept named selections that map to a canonical bucket; drop
+        // any Over/Under/h2h/yes-no shape (which historically produced
+        // degenerate `point=0` rows that could never settle).
+        const rawSel =
+          odd.name ?? odd.selection ?? odd.label ?? odd.outcome ??
+          odd.score ?? odd.result ?? null;
+        const priceVal =
+          odd.price ?? odd.odds ?? odd.odd ?? odd.value ?? odd.decimal ??
+          odd.dec ?? odd.coefficient;
+        const canonical = normalizeBucketSelection(dbMarket, rawSel);
+        bucketDiag.record(dbMarket, canonical);
+        if (canonical && priceVal != null) {
+          pushRow({
+            market: dbMarket,
+            selection: canonical,
+            price: priceVal,
+            point: 0,
+            providerTs,
+          });
+        }
+        // else: drop silently — either not a bucket shape (Over/Under, etc.)
+        // or a bucket we don't recognize. Counted in bucketDiag.dropped.
       } else {
         // Generic listed-selection handler + shape sniffing for ANY market
         // the provider streams that we haven't explicitly mapped above.
@@ -715,13 +764,33 @@ function flattenEvent(evt) {
           odd.point ?? odd.line ?? odd.total ?? odd.hdp ?? odd.handicap ?? 0,
         );
         if (sel != null && priceVal != null) {
-          pushRow({
-            market: dbMarket,
-            selection: String(sel),
-            price: priceVal,
-            point: Number.isFinite(point) ? point : 0,
-            providerTs,
-          });
+          // TRACK B — for corners_hcp / cards_hcp side handicap markets, the
+          // provider sometimes streams outright/progression outcomes (e.g.
+          // "2D", "3E/3F/3G", "W73") through the generic branch. These are
+          // NOT match handicap sides and must be dropped, along with
+          // quarter lines. Only accept rows we can canonicalize to
+          // home/away, and rewrite the selection to homeName/awayName so
+          // downstream resolvers stay uniform.
+          if (SIDE_HANDICAP_MARKETS.has(dbMarket)) {
+            if (isQuarterLine(point)) continue;
+            const side = canonicalizeMatchSide(sel, homeName, awayName);
+            if (side !== "home" && side !== "away") continue;
+            pushRow({
+              market: dbMarket,
+              selection: side === "home" ? homeName : awayName,
+              price: priceVal,
+              point: Number.isFinite(point) ? point : 0,
+              providerTs,
+            });
+          } else {
+            pushRow({
+              market: dbMarket,
+              selection: String(sel),
+              price: priceVal,
+              point: Number.isFinite(point) ? point : 0,
+              providerTs,
+            });
+          }
         } else if (odd.over != null || odd.under != null) {
           const pt = Number(odd.total ?? odd.point ?? odd.line ?? odd.hdp ?? 0);
           if (odd.over  != null) pushRow({ market: dbMarket, selection: "Over",  price: odd.over,  point: pt, providerTs });
@@ -732,6 +801,8 @@ function flattenEvent(evt) {
         } else if (odd.home != null || odd.away != null || odd.draw != null) {
           const hcp = Number(odd.hdp ?? odd.hcp ?? odd.handicap ?? odd.point ?? odd.line ?? odd.spread);
           if (Number.isFinite(hcp)) {
+            // TRACK B — quarter-line policy also enforced on the generic spreads-shape fallback.
+            if (SIDE_HANDICAP_MARKETS.has(dbMarket) && isQuarterLine(hcp)) continue;
             if (odd.home != null) pushRow({ market: dbMarket, selection: homeName, price: odd.home, point:  hcp, providerTs });
             if (odd.away != null) pushRow({ market: dbMarket, selection: awayName, price: odd.away, point: -hcp, providerTs });
           } else {
@@ -906,6 +977,7 @@ async function handleEvent(evt) {
   // only way to attribute them to a sport is by joining on this cache.
   rememberEventMeta(rawId, evt);
   const rawRows = flattenEvent(evt);
+  maybeLogBucketDiag(); // TRACK A — periodic bucket diagnostics.
   if (!rawRows.length) return;
 
   // Dedupe by conflict key — Postgres rejects upsert when the same
@@ -933,9 +1005,33 @@ async function handleEvent(evt) {
     if (rows.length === 0) return;
   }
 
-  const { error } = await supabase
+  // Sort rows by the exact conflict key so concurrent upserters (WS + REST +
+  // multiple bookmakers landing on the same event tick) acquire row locks in
+  // a consistent order. This is the standard remedy for Postgres 40P01
+  // "deadlock detected" on high-contention upserts. Sort is O(n log n) on
+  // small batches (<200 rows typical), negligible vs the network round-trip.
+  rows.sort((a, b) => {
+    if (a.event_id !== b.event_id) return a.event_id < b.event_id ? -1 : 1;
+    if (a.bookmaker !== b.bookmaker) return a.bookmaker < b.bookmaker ? -1 : 1;
+    if (a.market !== b.market) return a.market < b.market ? -1 : 1;
+    if (a.selection !== b.selection) return a.selection < b.selection ? -1 : 1;
+    return (a.point ?? 0) - (b.point ?? 0);
+  });
+
+  let { error } = await supabase
     .from("live_odds")
     .upsert(rows, { onConflict: "event_id,bookmaker,market,selection,point" });
+  // 40P01 = Postgres deadlock_detected. Loser is chosen arbitrarily; a single
+  // retry after a tiny jittered backoff almost always succeeds because the
+  // sorted-key ordering means concurrent writers won't deadlock again on the
+  // same tuples. Only retry once — persistent 40P01 signals a real problem.
+  if (error && (error.code === "40P01" || /deadlock/i.test(error.message ?? ""))) {
+    stats.upsertDeadlockRetries = (stats.upsertDeadlockRetries ?? 0) + 1;
+    await new Promise((r) => setTimeout(r, 25 + Math.floor(Math.random() * 50)));
+    ({ error } = await supabase
+      .from("live_odds")
+      .upsert(rows, { onConflict: "event_id,bookmaker,market,selection,point" }));
+  }
   if (error) {
     rememberError("live_odds_upsert", error);
     return;
@@ -1108,7 +1204,7 @@ if (REST_EXTENDED_ENABLED) {
 const ALL_MARKETS_ENABLED   = String(process.env.ALL_MARKETS_ENABLED ?? "true").toLowerCase() !== "false";
 const ALL_MARKETS_POLL_MS   = Number(process.env.ALL_MARKETS_POLL_MS ?? 45_000);
 const ALL_MARKETS_CHUNK     = Number(process.env.ALL_MARKETS_CHUNK ?? 8);
-const ALL_MARKETS_MAX_EVENTS= Number(process.env.ALL_MARKETS_MAX_EVENTS ?? 120);
+const ALL_MARKETS_MAX_EVENTS= Number(process.env.ALL_MARKETS_MAX_EVENTS ?? 60);
 const ALL_MARKETS_SPORTS    = (process.env.ALL_MARKETS_SPORTS ?? "soccer,football,basketball")
   .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 const ALL_MARKETS_BASE_URL  = process.env.ALL_MARKETS_BASE_URL ?? "https://api.odds-api.io/v3/odds/multi";
@@ -1823,6 +1919,18 @@ process.on("uncaughtException", (e) => { rememberError("uncaught", e); });
 process.on("unhandledRejection", (e) => { rememberError("unhandled", e); });
 
 // ─── Boot ─────────────────────────────────────────────────────────────────
+// Loud, unmistakable fingerprint so Railway ops can confirm exactly which
+// revision is live and whether the Track A / Track B code paths are loaded.
+// If any of these show `MISSING`, the container is running a stale image.
+const FEATURE_FLAGS = {
+  bucket_markets_loaded: typeof BUCKET_MARKETS !== "undefined" && BUCKET_MARKETS.has("exact_goals") && BUCKET_MARKETS.has("multi_goals"),
+  side_handicap_markets_loaded: typeof SIDE_HANDICAP_MARKETS !== "undefined" && SIDE_HANDICAP_MARKETS.has("corners_hcp") && SIDE_HANDICAP_MARKETS.has("cards_hcp"),
+  canonicalize_match_side: typeof canonicalizeMatchSide === "function",
+  is_quarter_line: typeof isQuarterLine === "function",
+  normalize_bucket_selection: typeof normalizeBucketSelection === "function",
+  bucket_diag_logger: typeof maybeLogBucketDiag === "function",
+};
+console.log(`[boot] === odds-api-bridge fingerprint === bridge="odds-api-bridge" version=v${VERSION} node=${process.version} git_sha=${process.env.RAILWAY_GIT_COMMIT_SHA ?? process.env.GIT_SHA ?? "unset"} built_at=${process.env.BUILD_TIMESTAMP ?? "unset"} feature_flags=${JSON.stringify(FEATURE_FLAGS)}`);
 console.log(`[boot] starting odds-api-bridge v${VERSION} file=${import.meta.url} cwd=${process.cwd()} keys=${ODDS_API_KEYS.length} primaryKeyFp=${KEY_FINGERPRINT} ws_connections=${connections.length} sports=${SPORTS.length} marketGroups=${MARKET_GROUPS.length} totalMarkets=${MARKETS.length}`);
 // Note: provider streams ALL markets when the `markets` param is omitted,
 // and each API key permits 2 parallel WS connections (cap: 10 sports per WS).

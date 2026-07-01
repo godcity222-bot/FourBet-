@@ -1,6 +1,6 @@
 {
   "name": "odds-api-bridge",
-  "version": "2.0.30",
+  "version": "2.0.29",
   "description": "WebSocket bridge: odds-api.io -> Supabase live_odds. Two WS connections per key, all markets, upserts on every odds change.",
   "type": "module",
   "main": "src/index.js",
