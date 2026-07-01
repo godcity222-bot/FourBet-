@@ -681,10 +681,45 @@ function flattenEvent(evt) {
       } else if (baseType === "spreads") {
         const point = Number(odd.hdp ?? odd.hcp ?? odd.handicap ?? odd.point ?? odd.line ?? odd.spread);
         if (!Number.isFinite(point)) continue;
-        // TRACK B — for corners_hcp / cards_hcp, drop quarter-lines at
-        // ingestion (policy: integer + .5 only). Belt-and-suspenders with
-        // the resolver-level reject.
-        if (SIDE_HANDICAP_MARKETS.has(dbMarket) && isQuarterLine(point)) continue;
+        // TRACK B (v2.0.30) — for corners_hcp / cards_hcp:
+        //   1. reject quarter lines (.25 / .75) — integer + .5 only
+        //   2. reject bracket / progression / outright placeholder names
+        //      that leak into the spreads shape (e.g. "2D", "W73",
+        //      "3E/3F/3G", "Runner-up") via canonicalizeMatchSide
+        //   3. if the payload carries a labeled outcome (odd.name /
+        //      selection / label / outcome), it MUST canonicalize to
+        //      home or away; otherwise drop the row
+        //   4. rewrite accepted selections to literal "Home" / "Away"
+        //      so downstream stays uniform regardless of team-name feed
+        if (SIDE_HANDICAP_MARKETS.has(dbMarket)) {
+          if (isQuarterLine(point)) continue;
+          const rawLabel =
+            odd.name ?? odd.selection ?? odd.label ?? odd.outcome ?? null;
+          if (rawLabel != null) {
+            const side = canonicalizeMatchSide(rawLabel, homeName, awayName);
+            if (side !== "home" && side !== "away") continue;
+            const priceVal =
+              odd.price ?? odd.odds ?? odd.odd ?? odd.value ?? odd.decimal ??
+              odd.dec ?? odd.coefficient ??
+              (side === "home"
+                ? (odd.home ?? odd.homeOdds ?? odd.home_price ?? odd.h)
+                : (odd.away ?? odd.awayOdds ?? odd.away_price ?? odd.a));
+            if (priceVal == null) continue;
+            pushRow({
+              market: dbMarket,
+              selection: side === "home" ? "Home" : "Away",
+              price: priceVal,
+              point: side === "home" ? point : -point,
+              providerTs,
+            });
+            continue;
+          }
+          const homePrice = odd.home ?? odd.homeOdds ?? odd.home_price ?? odd.h;
+          const awayPrice = odd.away ?? odd.awayOdds ?? odd.away_price ?? odd.a;
+          if (homePrice != null) pushRow({ market: dbMarket, selection: "Home", price: homePrice, point, providerTs });
+          if (awayPrice != null) pushRow({ market: dbMarket, selection: "Away", price: awayPrice, point: -point, providerTs });
+          continue;
+        }
         const homePrice = odd.home ?? odd.homeOdds ?? odd.home_price ?? odd.h;
         const awayPrice = odd.away ?? odd.awayOdds ?? odd.away_price ?? odd.a;
         pushRow({ market: dbMarket, selection: homeName, price: homePrice, point, providerTs });
@@ -777,7 +812,7 @@ function flattenEvent(evt) {
             if (side !== "home" && side !== "away") continue;
             pushRow({
               market: dbMarket,
-              selection: side === "home" ? homeName : awayName,
+              selection: side === "home" ? "Home" : "Away",
               price: priceVal,
               point: Number.isFinite(point) ? point : 0,
               providerTs,
@@ -803,8 +838,11 @@ function flattenEvent(evt) {
           if (Number.isFinite(hcp)) {
             // TRACK B — quarter-line policy also enforced on the generic spreads-shape fallback.
             if (SIDE_HANDICAP_MARKETS.has(dbMarket) && isQuarterLine(hcp)) continue;
-            if (odd.home != null) pushRow({ market: dbMarket, selection: homeName, price: odd.home, point:  hcp, providerTs });
-            if (odd.away != null) pushRow({ market: dbMarket, selection: awayName, price: odd.away, point: -hcp, providerTs });
+            const isSideHcp = SIDE_HANDICAP_MARKETS.has(dbMarket);
+            const homeSel = isSideHcp ? "Home" : homeName;
+            const awaySel = isSideHcp ? "Away" : awayName;
+            if (odd.home != null) pushRow({ market: dbMarket, selection: homeSel, price: odd.home, point:  hcp, providerTs });
+            if (odd.away != null) pushRow({ market: dbMarket, selection: awaySel, price: odd.away, point: -hcp, providerTs });
           } else {
             if (odd.home != null) pushRow({ market: dbMarket, selection: homeName, price: odd.home, providerTs });
             if (odd.draw != null) pushRow({ market: dbMarket, selection: "Draw",   price: odd.draw, providerTs });
@@ -1929,6 +1967,10 @@ const FEATURE_FLAGS = {
   is_quarter_line: typeof isQuarterLine === "function",
   normalize_bucket_selection: typeof normalizeBucketSelection === "function",
   bucket_diag_logger: typeof maybeLogBucketDiag === "function",
+  // v2.0.30 — dedicated spreads branch now runs canonicalizeMatchSide +
+  // bracket-placeholder reject for corners_hcp / cards_hcp, and rewrites
+  // accepted sides to literal "Home" / "Away".
+  spreads_branch_side_hcp_hardened: true,
 };
 console.log(`[boot] === odds-api-bridge fingerprint === bridge="odds-api-bridge" version=v${VERSION} node=${process.version} git_sha=${process.env.RAILWAY_GIT_COMMIT_SHA ?? process.env.GIT_SHA ?? "unset"} built_at=${process.env.BUILD_TIMESTAMP ?? "unset"} feature_flags=${JSON.stringify(FEATURE_FLAGS)}`);
 console.log(`[boot] starting odds-api-bridge v${VERSION} file=${import.meta.url} cwd=${process.cwd()} keys=${ODDS_API_KEYS.length} primaryKeyFp=${KEY_FINGERPRINT} ws_connections=${connections.length} sports=${SPORTS.length} marketGroups=${MARKET_GROUPS.length} totalMarkets=${MARKETS.length}`);
